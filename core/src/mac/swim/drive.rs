@@ -4,9 +4,9 @@ use anyhow::Result;
 use log::*;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use snow_floppy::flux::FluxTicks;
+use snow_floppy::noise::Noise;
 use snow_floppy::{Floppy, FloppyImage, FloppyType, TrackLength, TrackType};
 use strum::Display;
 
@@ -214,6 +214,8 @@ enum DriveWriteReg {
 /// A single disk drive, attached to the drive controller
 #[derive(Serialize, Deserialize)]
 pub(crate) struct FloppyDrive {
+    #[serde(default)]
+    noise: std::cell::RefCell<Noise>,
     idx: usize,
     base_frequency: Ticks,
     pub(crate) drive_type: DriveType,
@@ -284,7 +286,18 @@ impl FloppyDrive {
     const TACHO_SPEED: Ticks = 60;
 
     pub fn new(idx: usize, drive_type: DriveType, base_frequency: Ticks) -> Self {
+        Self::new_seeded(idx, drive_type, base_frequency, None)
+    }
+
+    /// Creates a drive with isolated noise, including its uninserted blank medium.
+    pub fn new_seeded(
+        idx: usize,
+        drive_type: DriveType,
+        base_frequency: Ticks,
+        seed: Option<u64>,
+    ) -> Self {
         Self {
+            noise: seed.map(Noise::seeded).unwrap_or_default().into(),
             idx,
             base_frequency,
             drive_type,
@@ -293,7 +306,12 @@ impl FloppyDrive {
             floppy_ejected: None,
             track: 4,
             stepdir: HeadStepDirection::Up,
-            floppy: FloppyImage::new(FloppyType::Mac400K, ""),
+            floppy: FloppyImage::new_with_noise(
+                FloppyType::Mac400K,
+                "",
+                seed.map(|s| Noise::seeded(s ^ 0x4449534B))
+                    .unwrap_or_default(),
+            ),
             track_position: 0,
             motor: false,
             mfm: drive_type.io_mfm(),
@@ -603,7 +621,7 @@ impl FloppyDrive {
 
         // Garbage if drive is not yet ready
         if self.not_ready > self.cycles {
-            return rand::rng().random();
+            return self.noise.borrow_mut().bit();
         }
 
         match self.floppy.get_track_type(head, track) {

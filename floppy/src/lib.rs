@@ -1,10 +1,11 @@
 pub mod flux;
 pub mod loaders;
-mod macformat;
+pub mod macformat;
 
 use std::collections::HashMap;
 
-use rand::Rng;
+pub mod noise;
+use noise::Noise;
 use serde::{Deserialize, Serialize};
 use serde_big_array::{Array, BigArray};
 use strum::EnumIter;
@@ -153,6 +154,8 @@ pub trait Floppy {
 /// An in-memory loaded floppy image
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FloppyImage {
+    #[serde(default)]
+    noise: Noise,
     floppy_type: FloppyType,
 
     /// Bitstream track data
@@ -196,7 +199,13 @@ impl FloppyImage {
     ///
     /// Image is filled with random noise
     pub fn new(floppy_type: FloppyType, title: &str) -> Self {
+        Self::new_with_noise(floppy_type, title, Noise::default())
+    }
+
+    /// Creates blank media using an explicitly owned noise generator.
+    pub fn new_with_noise(floppy_type: FloppyType, title: &str, noise: Noise) -> Self {
         let mut img = Self::new_internal(floppy_type, title);
+        img.noise = noise;
         for side in 0..FLOPPY_MAX_SIDES {
             for track in 0..FLOPPY_MAX_TRACKS {
                 img.set_actual_track_length(
@@ -220,6 +229,7 @@ impl FloppyImage {
     fn new_internal(floppy_type: FloppyType, title: &str) -> Self {
         Self {
             floppy_type,
+            noise: Noise::default(),
             trackdata: core::array::from_fn(|_| Default::default()),
             flux_trackdata: core::array::from_fn(|_| Default::default()),
             bitlen: [Default::default(); FLOPPY_MAX_SIDES],
@@ -239,8 +249,7 @@ impl FloppyImage {
         };
 
         self.bitlen[side][track] = sz;
-        let mut rng = rand::rng();
-        self.trackdata[side][track].resize_with(sz / 8 + 1, || rng.random());
+        self.trackdata[side][track].resize_with(sz / 8 + 1, || self.noise.byte());
     }
 
     pub fn get_track_type(&self, side: usize, track: usize) -> TrackType {

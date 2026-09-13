@@ -222,7 +222,18 @@ impl<'a> MacFormatEncoder<'a> {
         tags: Option<&'a [u8]>,
         name: &str,
     ) -> Result<FloppyImage> {
-        let mut encoder = Self::new(format, data, tags, name)?;
+        Self::encode_with_noise(format, data, tags, name, crate::noise::Noise::default())
+    }
+
+    /// Encodes media with deterministic, caller-owned padding noise when seeded.
+    pub fn encode_with_noise(
+        format: FloppyType,
+        data: &'a [u8],
+        tags: Option<&'a [u8]>,
+        name: &str,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
+        let mut encoder = Self::new(format, data, tags, name, noise)?;
         encoder.run()?;
         Ok(encoder.image)
     }
@@ -264,6 +275,7 @@ impl<'a> MacFormatEncoder<'a> {
         data: &'a [u8],
         tags: Option<&'a [u8]>,
         title: &str,
+        noise: crate::noise::Noise,
     ) -> Result<Self> {
         match format {
             FloppyType::Mac400K | FloppyType::Mac800K => (),
@@ -289,7 +301,7 @@ impl<'a> MacFormatEncoder<'a> {
         Ok(Self {
             data,
             tags,
-            image: FloppyImage::new_empty(format, title),
+            image: FloppyImage::new_with_noise(format, title, noise),
             enc_track: 0,
             enc_side: 0,
         })

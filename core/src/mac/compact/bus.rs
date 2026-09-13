@@ -851,13 +851,19 @@ where
     TRenderer: Renderer,
 {
     fn inspect_read(&mut self, addr: Address) -> Option<Byte> {
-        // Everything up to 0x800000 is safe (RAM/ROM only)
-        if addr >= 0x80_0000 {
-            None
-        } else if self.overlay {
-            self.read_overlay(addr)
-        } else {
-            self.read_normal(addr)
+        match (self.overlay, addr) {
+            (
+                true,
+                0x0000_0000..=0x000F_FFFF | 0x0020_0000..=0x002F_FFFF | 0x0040_0000..=0x004F_FFFF,
+            )
+            | (false, 0x0040_0000..=0x004F_FFFF) => {
+                self.rom.get(addr as usize & self.rom_mask).copied()
+            }
+            (true, 0x0060_0000..=0x007F_FFFF)
+            | (false, 0x0000_0000..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF) => {
+                self.ram.get(addr as usize & self.ram_mask).copied()
+            }
+            _ => None,
         }
     }
 

@@ -206,6 +206,15 @@ impl Rtc {
         self.data.pram = pram;
     }
 
+    /// Initializes an isolated RTC without consulting host time or files.
+    pub fn initialize(&mut self, seconds: u32, pram: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(pram.len() == PRAM_SIZE, "Invalid PRAM length");
+        self.data.seconds = seconds;
+        self.data.pram.copy_from_slice(pram);
+        self.last_second_real_time_ms = None;
+        Ok(())
+    }
+
     /// Sets the RTC to a specific date/time.
     /// This can be used to test date-dependent software behavior (e.g., easter eggs).
     pub fn set_datetime(&mut self, dt: chrono::NaiveDateTime) {

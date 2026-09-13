@@ -94,6 +94,8 @@ enum SwimMode {
 /// Sander-Wozniak Integrated Machine - floppy drive controller
 #[derive(Serialize, Deserialize)]
 pub struct Swim {
+    #[serde(default)]
+    noise: snow_floppy::noise::Noise,
     ism_available: bool,
 
     cycles: Ticks,
@@ -149,13 +151,31 @@ pub struct Swim {
 
 impl Swim {
     pub fn new(drives: &[DriveType], ism_available: bool, base_frequency: Ticks) -> Self {
+        Self::new_seeded(drives, ism_available, base_frequency, None)
+    }
+
+    /// Constructs a controller with independent deterministic streams when requested.
+    pub fn new_seeded(
+        drives: &[DriveType],
+        ism_available: bool,
+        base_frequency: Ticks,
+        seed: Option<u64>,
+    ) -> Self {
         Self {
+            noise: seed
+                .map(snow_floppy::noise::Noise::seeded)
+                .unwrap_or_default(),
             drives: core::array::from_fn(|i| {
-                FloppyDrive::new(
-                    i,
-                    *drives.get(i).unwrap_or(&DriveType::None),
-                    base_frequency,
-                )
+                let drive_type = *drives.get(i).unwrap_or(&DriveType::None);
+                match seed {
+                    Some(seed) => FloppyDrive::new_seeded(
+                        i,
+                        drive_type,
+                        base_frequency,
+                        Some(seed.wrapping_add(i as u64 + 1)),
+                    ),
+                    None => FloppyDrive::new(i, drive_type, base_frequency),
+                }
             }),
             ism_available,
 

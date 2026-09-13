@@ -3,6 +3,7 @@ pub mod bus;
 pub mod cpu_m68k;
 pub mod debuggable;
 pub mod emulator;
+pub mod headless;
 pub mod keymap;
 pub mod mac;
 pub mod renderer;

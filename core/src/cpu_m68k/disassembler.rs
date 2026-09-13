@@ -59,6 +59,7 @@ impl std::fmt::Display for DisassemblyEntry {
 }
 
 pub struct Disassembler<'a> {
+    cpu_type: CpuM68kType,
     /// Input iterator
     iter: &'a mut dyn Iterator<Item = u8>,
 
@@ -169,7 +170,17 @@ impl<'a> Disassembler<'a> {
     }
 
     pub fn from(iter: &'a mut dyn Iterator<Item = u8>, addr: Address) -> Self {
+        Self::for_cpu(iter, addr, CpuM68kType::MAX)
+    }
+
+    /// Decodes only instructions available on the selected CPU.
+    pub fn for_cpu(
+        iter: &'a mut dyn Iterator<Item = u8>,
+        addr: Address,
+        cpu_type: CpuM68kType,
+    ) -> Self {
         Self {
+            cpu_type,
             addr,
             iter,
             out: DisassemblyEntry {
@@ -1288,7 +1299,7 @@ impl Iterator for Disassembler<'_> {
         self.out.raw.push(op_msb);
         self.out.raw.push(op_lsb);
 
-        let instr = Instruction::try_decode(CpuM68kType::MAX, opcode);
+        let instr = Instruction::try_decode(self.cpu_type, opcode);
 
         if let Ok(i) = instr {
             self.do_instr(&i).ok()?;
