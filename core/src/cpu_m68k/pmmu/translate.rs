@@ -582,7 +582,7 @@ where
     /// Records a page-fault history entry if history recording is enabled.
     fn pmmu_record_pagefault(&mut self, vaddr: Address, writing: bool) {
         if self.history_enabled {
-            self.history.push_back(HistoryEntry::Pagefault {
+            self.push_history(HistoryEntry::Pagefault {
                 address: vaddr,
                 write: writing,
             });

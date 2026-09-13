@@ -158,7 +158,7 @@ macro_rules! dispatch {
 /// Emulator config. Basically an abstraction on top of the CPU for multiple different model groups
 /// that provides access to the inner components by the emulator runner through dynamic dispatch.
 #[derive(Serialize, Deserialize)]
-enum EmulatorConfig {
+pub(crate) enum EmulatorConfig {
     /// Compact series - Mac 128K, 512K, Plus, SE, Classic
     Compact(Box<CpuM68000<CompactMacBus<ChannelRenderer>>>),
     /// Macintosh Portable
@@ -193,6 +193,7 @@ dispatch! {
     immutable_calls {
         fn model(&self) -> MacModel { bus.model() }
         fn cpu_has_pmmu(&self) -> bool { has_pmmu() }
+        fn cpu_history_status(&self) -> (bool, u64, bool, u64, usize) { history_status() }
         fn cpu_cycles(&self) -> Ticks { cycles }
         fn cpu_breakpoints(&self) -> &[Breakpoint] { breakpoints() }
         fn cpu_get_step_over(&self) -> Option<Address> { get_step_over() }
@@ -217,6 +218,10 @@ dispatch! {
         fn cpu_read_history(&mut self) -> Option<&[HistoryEntry]> { read_history() }
         fn cpu_read_systrap_history(&mut self) -> Option<&[SystrapHistoryEntry]> { read_systrap_history() }
         fn cpu_prefetch_refill(&mut self) -> Result<()> { prefetch_refill() }
+        fn cpu_take_breakpoint_hits(&mut self) -> (Vec<crate::cpu_m68k::cpu::BreakpointHit>, u64) { take_breakpoint_hits() }
+        fn cpu_step(&mut self) -> Result<()> { step() }
+        fn cpu_sync_bus(&mut self) -> Result<()> { sync_bus() }
+        fn try_mouse_update_abs(&mut self, x: u16, y: u16) -> bool { bus.try_mouse_update_abs(x, y) }
         fn cpu_reset(&mut self) -> Result<()> { reset() }
 
         fn bus_reset(&mut self) -> Result<bool> { bus.reset(true) }
@@ -298,189 +303,17 @@ impl Emulator {
         let renderer = ChannelRenderer::new(0, 0)?;
         let frame_recv = renderer.get_receiver();
 
-        let mut config = match model {
-            MacModel::Early128K
-            | MacModel::Early512K
-            | MacModel::Early512Ke
-            | MacModel::Plus
-            | MacModel::SE
-            | MacModel::SeFdhd
-            | MacModel::Classic => {
-                assert!(!pmmu_enabled, "PMMU not available on compact models");
-
-                // Find extension ROM if present
-                let extension_rom = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::ExtensionROM(data) => Some(*data),
-                    _ => None,
-                });
-
-                // Initialize bus and CPU
-                let bus = CompactMacBus::new(
-                    model,
-                    rom,
-                    extension_rom,
-                    renderer,
-                    mouse_mode,
-                    ram_size,
-                    override_fdd_type,
-                );
-                let cpu = Box::new(CpuM68000::new(bus));
-                assert_eq!(cpu.get_type(), model.cpu_type());
-
-                EmulatorConfig::Compact(cpu)
-            }
-            MacModel::Portable | MacModel::Portable15MB => {
-                assert!(!pmmu_enabled, "PMMU not available on compact models");
-
-                // Find extension ROM if present
-                let extension_rom = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::ExtensionROM(data) => Some(*data),
-                    _ => None,
-                });
-
-                // Initialize bus and CPU
-                let bus =
-                    MacPortableBus::new(model, rom, extension_rom, renderer, mouse_mode, ram_size);
-                let cpu = Box::new(CpuM68000::new(bus));
-                assert_eq!(cpu.get_type(), model.cpu_type());
-
-                EmulatorConfig::Portable(cpu)
-            }
-            MacModel::MacII | MacModel::MacIIFDHD => {
-                assert!(override_fdd_type.is_none());
-
-                // Find display card ROM and the selected card type
-                let Some((kind, mdcrom)) = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::MDC12(data) => Some((NubusDeviceKind::Mdc12, *data)),
-                    ExtraROMs::Toby(data) => Some((NubusDeviceKind::Toby, *data)),
-                    _ => None,
-                }) else {
-                    bail!("Macintosh II requires display card ROM")
-                };
-                let nubus = [NubusCardConfig {
-                    slot: 0x9,
-                    kind,
-                    rom: mdcrom,
-                }];
-
-                // Find extension ROM if present
-                let extension_rom = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::ExtensionROM(data) => Some(*data),
-                    _ => None,
-                });
-
-                if !pmmu_enabled {
-                    // Initialize bus and CPU
-                    let bus = MacIIBus::new(
-                        model,
-                        rom,
-                        &nubus,
-                        extension_rom,
-                        vec![renderer],
-                        monitor.unwrap_or_default(),
-                        mouse_mode,
-                        ram_size,
-                    );
-                    let cpu = Box::new(CpuM68020Fpu::new(bus));
-                    assert_eq!(cpu.get_type(), model.cpu_type());
-
-                    EmulatorConfig::MacII(cpu)
-                } else {
-                    // Initialize bus and CPU
-                    let bus = MacIIBus::new(
-                        model,
-                        rom,
-                        &nubus,
-                        extension_rom,
-                        vec![renderer],
-                        monitor.unwrap_or_default(),
-                        mouse_mode,
-                        ram_size,
-                    );
-                    let cpu = Box::new(CpuM68020Pmmu::new(bus));
-                    assert_eq!(cpu.get_type(), model.cpu_type());
-
-                    EmulatorConfig::MacIIPmmu(cpu)
-                }
-            }
-            MacModel::MacIIx | MacModel::MacIIcx => {
-                assert!(override_fdd_type.is_none());
-
-                // Find display card ROM and the selected card type
-                let Some((kind, mdcrom)) = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::MDC12(data) => Some((NubusDeviceKind::Mdc12, *data)),
-                    ExtraROMs::Toby(data) => Some((NubusDeviceKind::Toby, *data)),
-                    _ => None,
-                }) else {
-                    bail!("Macintosh II requires display card ROM")
-                };
-                let nubus = [NubusCardConfig {
-                    slot: 0x9,
-                    kind,
-                    rom: mdcrom,
-                }];
-
-                // Find extension ROM if present
-                let extension_rom = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::ExtensionROM(data) => Some(*data),
-                    _ => None,
-                });
-
-                // Initialize bus and CPU
-                let bus = MacIIBus::new(
-                    model,
-                    rom,
-                    &nubus,
-                    extension_rom,
-                    vec![renderer],
-                    monitor.unwrap_or_default(),
-                    mouse_mode,
-                    ram_size,
-                );
-                let cpu = Box::new(CpuM68030Fpu::new(bus));
-                assert_eq!(cpu.get_type(), model.cpu_type());
-
-                EmulatorConfig::MacII30(cpu)
-            }
-            MacModel::SE30 => {
-                assert!(override_fdd_type.is_none());
-
-                // Find video ROM
-                let Some(ExtraROMs::SE30Video(vrom)) = extra_roms
-                    .iter()
-                    .find(|p| matches!(p, ExtraROMs::SE30Video(_)))
-                else {
-                    bail!("Macintosh SE/30 requires video ROM")
-                };
-                let nubus = [NubusCardConfig {
-                    slot: 0xE,
-                    kind: NubusDeviceKind::SE30Video,
-                    rom: vrom,
-                }];
-
-                // Find extension ROM if present
-                let extension_rom = extra_roms.iter().find_map(|p| match p {
-                    ExtraROMs::ExtensionROM(data) => Some(*data),
-                    _ => None,
-                });
-
-                // Initialize bus and CPU
-                let bus = MacIIBus::new(
-                    model,
-                    rom,
-                    &nubus,
-                    extension_rom,
-                    vec![renderer],
-                    monitor.unwrap_or_default(),
-                    mouse_mode,
-                    ram_size,
-                );
-                let cpu = Box::new(CpuM68030Fpu::new(bus));
-                assert_eq!(cpu.get_type(), model.cpu_type());
-
-                EmulatorConfig::MacII30(cpu)
-            }
-        };
+        let mut config = construct_config(
+            rom,
+            extra_roms,
+            model,
+            monitor,
+            mouse_mode,
+            ram_size,
+            override_fdd_type,
+            pmmu_enabled,
+            renderer,
+        )?;
 
         config.scsi_mut().set_shared_dir(shared_dir);
         config.cpu_reset()?;
@@ -1527,4 +1360,202 @@ impl Tickable for Emulator {
 
         Ok(ticks)
     }
+}
+
+/// Shared construction used by GUI runners and synchronous native owners.
+#[allow(clippy::too_many_arguments, clippy::large_stack_frames)]
+pub(crate) fn construct_config(
+    rom: &[u8],
+    extra_roms: &[ExtraROMs],
+    model: MacModel,
+    monitor: Option<MacMonitor>,
+    mouse_mode: MouseMode,
+    ram_size: Option<usize>,
+    override_fdd_type: Option<DriveType>,
+    pmmu_enabled: bool,
+    renderer: ChannelRenderer,
+) -> Result<EmulatorConfig> {
+    Ok(match model {
+        MacModel::Early128K
+        | MacModel::Early512K
+        | MacModel::Early512Ke
+        | MacModel::Plus
+        | MacModel::SE
+        | MacModel::SeFdhd
+        | MacModel::Classic => {
+            assert!(!pmmu_enabled, "PMMU not available on compact models");
+
+            // Find extension ROM if present
+            let extension_rom = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::ExtensionROM(data) => Some(*data),
+                _ => None,
+            });
+
+            // Initialize bus and CPU
+            let bus = CompactMacBus::new(
+                model,
+                rom,
+                extension_rom,
+                renderer,
+                mouse_mode,
+                ram_size,
+                override_fdd_type,
+            );
+            let cpu = Box::new(CpuM68000::new(bus));
+            assert_eq!(cpu.get_type(), model.cpu_type());
+
+            EmulatorConfig::Compact(cpu)
+        }
+        MacModel::Portable | MacModel::Portable15MB => {
+            assert!(!pmmu_enabled, "PMMU not available on compact models");
+
+            // Find extension ROM if present
+            let extension_rom = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::ExtensionROM(data) => Some(*data),
+                _ => None,
+            });
+
+            // Initialize bus and CPU
+            let bus =
+                MacPortableBus::new(model, rom, extension_rom, renderer, mouse_mode, ram_size);
+            let cpu = Box::new(CpuM68000::new(bus));
+            assert_eq!(cpu.get_type(), model.cpu_type());
+
+            EmulatorConfig::Portable(cpu)
+        }
+        MacModel::MacII | MacModel::MacIIFDHD => {
+            assert!(override_fdd_type.is_none());
+
+            // Find display card ROM and the selected card type
+            let Some((kind, mdcrom)) = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::MDC12(data) => Some((NubusDeviceKind::Mdc12, *data)),
+                ExtraROMs::Toby(data) => Some((NubusDeviceKind::Toby, *data)),
+                _ => None,
+            }) else {
+                bail!("Macintosh II requires display card ROM")
+            };
+            let nubus = [NubusCardConfig {
+                slot: 0x9,
+                kind,
+                rom: mdcrom,
+            }];
+
+            // Find extension ROM if present
+            let extension_rom = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::ExtensionROM(data) => Some(*data),
+                _ => None,
+            });
+
+            if !pmmu_enabled {
+                // Initialize bus and CPU
+                let bus = MacIIBus::new(
+                    model,
+                    rom,
+                    &nubus,
+                    extension_rom,
+                    vec![renderer],
+                    monitor.unwrap_or_default(),
+                    mouse_mode,
+                    ram_size,
+                );
+                let cpu = Box::new(CpuM68020Fpu::new(bus));
+                assert_eq!(cpu.get_type(), model.cpu_type());
+
+                EmulatorConfig::MacII(cpu)
+            } else {
+                // Initialize bus and CPU
+                let bus = MacIIBus::new(
+                    model,
+                    rom,
+                    &nubus,
+                    extension_rom,
+                    vec![renderer],
+                    monitor.unwrap_or_default(),
+                    mouse_mode,
+                    ram_size,
+                );
+                let cpu = Box::new(CpuM68020Pmmu::new(bus));
+                assert_eq!(cpu.get_type(), model.cpu_type());
+
+                EmulatorConfig::MacIIPmmu(cpu)
+            }
+        }
+        MacModel::MacIIx | MacModel::MacIIcx => {
+            assert!(override_fdd_type.is_none());
+
+            // Find display card ROM and the selected card type
+            let Some((kind, mdcrom)) = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::MDC12(data) => Some((NubusDeviceKind::Mdc12, *data)),
+                ExtraROMs::Toby(data) => Some((NubusDeviceKind::Toby, *data)),
+                _ => None,
+            }) else {
+                bail!("Macintosh II requires display card ROM")
+            };
+            let nubus = [NubusCardConfig {
+                slot: 0x9,
+                kind,
+                rom: mdcrom,
+            }];
+
+            // Find extension ROM if present
+            let extension_rom = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::ExtensionROM(data) => Some(*data),
+                _ => None,
+            });
+
+            // Initialize bus and CPU
+            let bus = MacIIBus::new(
+                model,
+                rom,
+                &nubus,
+                extension_rom,
+                vec![renderer],
+                monitor.unwrap_or_default(),
+                mouse_mode,
+                ram_size,
+            );
+            let cpu = Box::new(CpuM68030Fpu::new(bus));
+            assert_eq!(cpu.get_type(), model.cpu_type());
+
+            EmulatorConfig::MacII30(cpu)
+        }
+        MacModel::SE30 => {
+            assert!(override_fdd_type.is_none());
+
+            // Find video ROM
+            let Some(ExtraROMs::SE30Video(vrom)) = extra_roms
+                .iter()
+                .find(|p| matches!(p, ExtraROMs::SE30Video(_)))
+            else {
+                bail!("Macintosh SE/30 requires video ROM")
+            };
+            let nubus = [NubusCardConfig {
+                slot: 0xE,
+                kind: NubusDeviceKind::SE30Video,
+                rom: vrom,
+            }];
+
+            // Find extension ROM if present
+            let extension_rom = extra_roms.iter().find_map(|p| match p {
+                ExtraROMs::ExtensionROM(data) => Some(*data),
+                _ => None,
+            });
+
+            // Initialize bus and CPU
+            let bus = MacIIBus::new(
+                model,
+                rom,
+                &nubus,
+                extension_rom,
+                vec![renderer],
+                monitor.unwrap_or_default(),
+                mouse_mode,
+                ram_size,
+            );
+            let cpu = Box::new(CpuM68030Fpu::new(bus));
+            assert_eq!(cpu.get_type(), model.cpu_type());
+
+            EmulatorConfig::MacII30(cpu)
+        }
+    })
 }

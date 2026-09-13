@@ -175,6 +175,15 @@ pub struct Pmgr {
 }
 
 impl Pmgr {
+    /// Initializes the Portable's separate power-manager clock and PRAM deterministically.
+    pub fn initialize_clock(&mut self, seconds: u32, pram: &[u8]) -> Result<()> {
+        anyhow::ensure!(pram.len() == 256, "PRAM must contain 256 bytes");
+        self.time = seconds;
+        self.xpram.copy_from_slice(&pram[..128]);
+        self.rtc.initialize(seconds, pram)?;
+        Ok(())
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             low_level: DEFAULT_LOW_LEVEL as u8,

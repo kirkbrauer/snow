@@ -31,3 +31,7 @@ pub fn build_version() -> String {
         built_info::PKG_VERSION.to_string()
     }
 }
+
+pub mod debug_metadata;
+pub mod watch;
+use watch::WatchpointType;

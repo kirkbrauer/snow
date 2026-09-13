@@ -590,10 +590,15 @@ where
         self.mouse_mode = mode;
     }
 
-    /// Updates the mouse position (absolute coordinates)
+    /// Applies assisted positioning only after OS initialization.
     pub fn mouse_update_abs(&mut self, x: u16, y: u16) {
+        self.try_mouse_update_abs(x, y);
+    }
+
+    /// Updates the mouse position (absolute coordinates)
+    pub fn try_mouse_update_abs(&mut self, x: u16, y: u16) -> bool {
         if self.mouse_mode != MouseMode::Absolute {
-            return;
+            return false;
         }
 
         let old_x = self.read_ram::<u16>(Self::ADDR_RAWMOUSE_X);
@@ -602,7 +607,7 @@ where
         if !self.mouse_ready && (old_x != 15 || old_y != 15) {
             // Wait until the boot process has initialized the mouse position so we don't
             // interfere with the memory test.
-            return;
+            return false;
         }
         self.mouse_ready = true;
 
@@ -619,6 +624,7 @@ where
             self.write_ram(Self::ADDR_RAWMOUSE_Y, y);
         }
         self.write_ram(Self::ADDR_CRSRNEW, 1_u8);
+        true
     }
 
     /// Configures emulator speed
@@ -940,13 +946,18 @@ where
     TRenderer: Renderer,
 {
     fn inspect_read(&mut self, addr: Address) -> Option<Byte> {
-        // Everything up to 0x4FFFFFFF is safe (RAM/ROM only)
-        if addr >= 0x5000_0000 {
-            None
-        } else if self.overlay {
-            self.read_overlay(addr)
+        let addr = if AMU && self.amu_active {
+            self.amu_translate(addr)
         } else {
-            self.read_32bit(addr)
+            addr
+        };
+        match addr {
+            0..=0x4FFF_FFFF if self.overlay && !(AMU && self.amu_active) => {
+                self.rom.get(addr as usize & self.rom_mask).copied()
+            }
+            0..=0x3FFF_FFFF => self.ram.get(addr as usize & self.ram_mask).copied(),
+            0x4000_0000..=0x4FFF_FFFF => self.rom.get(addr as usize & self.rom_mask).copied(),
+            _ => None,
         }
     }
 

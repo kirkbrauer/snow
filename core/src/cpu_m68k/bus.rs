@@ -151,7 +151,10 @@ where
                                 b,
                                 self.regs.pc,
                             );
-                            self.breakpoint_hit.set();
+                            self.record_breakpoint_hit(
+                                Breakpoint::Bus(BusBreakpoint::Read, byte_addr),
+                                Some(b),
+                            );
                         }
                         break b.into();
                     }
@@ -363,7 +366,10 @@ where
                             b,
                             self.regs.pc
                         );
-                        self.breakpoint_hit.set();
+                        self.record_breakpoint_hit(
+                            Breakpoint::Bus(BusBreakpoint::Write, byte_addr),
+                            Some(b),
+                        );
                     }
 
                     if CPU_TYPE == M68000 && a == 1 {
@@ -436,7 +442,10 @@ where
                             b,
                             self.regs.pc
                         );
-                        self.breakpoint_hit.set();
+                        self.record_breakpoint_hit(
+                            Breakpoint::Bus(BusBreakpoint::Write, byte_addr),
+                            Some(b),
+                        );
                     }
 
                     if CPU_TYPE == M68000 && a == 2 {

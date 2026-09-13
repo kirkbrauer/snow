@@ -59,6 +59,16 @@ pub enum Breakpoint {
     StepOut(Address),
 }
 
+/// A trigger observed by the existing CPU breakpoint matcher. Execution returns later,
+/// at an instruction boundary; `pc` and `cycles` identify the trigger itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointHit {
+    pub trigger: Breakpoint,
+    pub pc: Address,
+    pub cycles: Ticks,
+    pub value: Option<u8>,
+}
+
 /// Address error/bus error details
 #[derive(Debug, Clone, Copy)]
 pub(in crate::cpu_m68k) struct Group0Details {
@@ -331,6 +341,15 @@ pub struct CpuM68k<
     #[serde(skip)]
     pub(in crate::cpu_m68k) breakpoint_hit: LatchingEvent,
 
+    #[serde(skip)]
+    breakpoint_hits: Vec<BreakpointHit>,
+    #[serde(skip)]
+    breakpoint_hits_dropped: u64,
+    #[serde(skip)]
+    history_total: u64,
+    #[serde(skip)]
+    systrap_history_total: u64,
+
     /// Next address to jump to for step over
     step_over_addr: Option<Address>,
 
@@ -417,6 +436,10 @@ where
             trace_mask: false,
             breakpoints: vec![],
             breakpoint_hit: LatchingEvent::default(),
+            breakpoint_hits: Vec::new(),
+            breakpoint_hits_dropped: 0,
+            history_total: 0,
+            systrap_history_total: 0,
             step_over_addr: None,
             history: VecDeque::with_capacity(Self::HISTORY_SIZE),
             history_current: HistoryEntryInstruction::default(),
@@ -466,6 +489,51 @@ where
         self.breakpoint_hit.get_clear()
     }
 
+    /// Drain bounded structured hits independently of the legacy GUI latch.
+    pub fn take_breakpoint_hits(&mut self) -> (Vec<BreakpointHit>, u64) {
+        (
+            std::mem::take(&mut self.breakpoint_hits),
+            std::mem::take(&mut self.breakpoint_hits_dropped),
+        )
+    }
+
+    pub(in crate::cpu_m68k) fn record_breakpoint_hit(
+        &mut self,
+        trigger: Breakpoint,
+        value: Option<u8>,
+    ) {
+        self.breakpoint_hit.set();
+        if self.breakpoint_hits.len() < 256 {
+            self.breakpoint_hits.push(BreakpointHit {
+                trigger,
+                pc: self.regs.pc,
+                cycles: self.cycles,
+                value,
+            });
+        } else {
+            self.breakpoint_hits_dropped += 1;
+        }
+    }
+
+    /// Recording status, lifetime entry counts since configuration, and ring capacity.
+    pub fn history_status(&self) -> (bool, u64, bool, u64, usize) {
+        (
+            self.history_enabled,
+            self.history_total,
+            self.systrap_history_enabled,
+            self.systrap_history_total,
+            Self::HISTORY_SIZE,
+        )
+    }
+
+    pub(in crate::cpu_m68k) fn push_history(&mut self, entry: HistoryEntry) {
+        while self.history.len() >= Self::HISTORY_SIZE {
+            self.history.pop_front();
+        }
+        self.history.push_back(entry);
+        self.history_total += 1;
+    }
+
     /// Reads the active breakpoints
     pub fn breakpoints(&self) -> &[Breakpoint] {
         &self.breakpoints
@@ -495,6 +563,7 @@ where
     pub fn enable_history(&mut self, val: bool) {
         self.history_enabled = val;
         self.history.clear();
+        self.history_total = 0;
         self.history_current = Default::default();
     }
 
@@ -502,6 +571,7 @@ where
     pub fn enable_systrap_history(&mut self, val: bool) {
         self.systrap_history_enabled = val;
         self.systrap_history.clear();
+        self.systrap_history_total = 0;
     }
 
     /// Gets the instruction history, if enabled
@@ -756,10 +826,7 @@ where
             entry.final_regs = Some(self.regs.clone());
             entry.ea = self.step_ea_addr;
 
-            while self.history.len() >= Self::HISTORY_SIZE {
-                self.history.pop_front();
-            }
-            self.history.push_back(HistoryEntry::Instruction(entry));
+            self.push_history(HistoryEntry::Instruction(entry));
         }
 
         match execute_result {
@@ -868,7 +935,7 @@ where
                     "Breakpoint hit (interrupt level): {}, PC: ${:08X}",
                     level, self.regs.pc
                 );
-                self.breakpoint_hit.set();
+                self.record_breakpoint_hit(Breakpoint::InterruptLevel(level), None);
             }
 
             self.raise_irq(
@@ -883,13 +950,13 @@ where
             .contains(&Breakpoint::Execution(self.regs.pc))
         {
             info!("Breakpoint hit (execution): ${:08X}", self.regs.pc);
-            self.breakpoint_hit.set();
+            self.record_breakpoint_hit(Breakpoint::Execution(self.regs.pc), None);
         }
         if self
             .breakpoints
             .contains(&Breakpoint::StepOver(self.regs.pc))
         {
-            self.breakpoint_hit.set();
+            self.record_breakpoint_hit(Breakpoint::StepOver(self.regs.pc), None);
             self.clear_breakpoint(Breakpoint::StepOver(self.regs.pc));
         }
 
@@ -899,11 +966,13 @@ where
     /// Tests if we should stop due to 'step out' debugger action
     fn test_step_out(&mut self) {
         let mut bp_hit = false;
+        let mut hit_sp = 0;
         let sp = self.regs.read_a::<Address>(7);
         self.breakpoints.retain(|bp| {
             if let Breakpoint::StepOut(addr) = bp {
                 if *addr < sp {
                     bp_hit = true;
+                    hit_sp = *addr;
                     false
                 } else {
                     true
@@ -913,7 +982,7 @@ where
             }
         });
         if bp_hit {
-            self.breakpoint_hit.set();
+            self.record_breakpoint_hit(Breakpoint::StepOut(hit_sp), None);
         }
     }
 
@@ -1023,7 +1092,7 @@ where
                 "Breakpoint hit (exception vector): {:08X}, PC: ${:08X}",
                 vector, self.regs.pc
             );
-            self.breakpoint_hit.set();
+            self.record_breakpoint_hit(Breakpoint::ExceptionVector(vector), None);
         }
 
         // Jump to vector
@@ -1035,7 +1104,7 @@ where
         self.prefetch_pump()?;
 
         if self.history_enabled {
-            self.history.push_back(HistoryEntry::Exception {
+            self.push_history(HistoryEntry::Exception {
                 vector,
                 cycles: self.cycles - start_cycles,
             });
@@ -1228,7 +1297,7 @@ where
                 "Breakpoint hit (exception vector): {:08X}, PC: ${:08X}",
                 vector, self.regs.pc
             );
-            self.breakpoint_hit.set();
+            self.record_breakpoint_hit(Breakpoint::ExceptionVector(vector), None);
         }
 
         let vector_base = if CPU_TYPE >= M68010 { self.regs.vbr } else { 0 };
@@ -1239,7 +1308,7 @@ where
         self.prefetch_pump()?;
 
         if self.history_enabled {
-            self.history.push_back(HistoryEntry::Exception {
+            self.push_history(HistoryEntry::Exception {
                 vector,
                 cycles: self.cycles - start_cycles,
             });
@@ -1456,13 +1525,14 @@ where
                         "Breakpoint hit (LINEA): ${:04X}, PC: ${:08X}",
                         instr.data, self.regs.pc
                     );
-                    self.breakpoint_hit.set();
+                    self.record_breakpoint_hit(Breakpoint::LineA(instr.data), None);
                 }
 
                 if self.systrap_history_enabled {
                     while self.systrap_history.len() >= Self::HISTORY_SIZE {
                         self.systrap_history.pop_front();
                     }
+                    self.systrap_history_total += 1;
                     self.systrap_history.push_back(SystrapHistoryEntry {
                         trap: instr.data,
                         cycles: self.cycles,
@@ -1521,7 +1591,7 @@ where
                 "Breakpoint hit (LINEF): ${:04X}, PC: ${:08X}",
                 instr.data, self.regs.pc
             );
-            self.breakpoint_hit.set();
+            self.record_breakpoint_hit(Breakpoint::LineF(instr.data), None);
         }
 
         self.advance_cycles(4)?;
