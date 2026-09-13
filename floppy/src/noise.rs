@@ -20,6 +20,10 @@ impl Noise {
         }
     }
 
+    pub fn draws(&self) -> u64 {
+        self.draws
+    }
+
     pub fn byte(&mut self) -> u8 {
         self.draws = self.draws.wrapping_add(1);
         match self.stream.as_mut() {

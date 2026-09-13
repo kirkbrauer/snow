@@ -150,6 +150,10 @@ pub struct Swim {
 }
 
 impl Swim {
+    pub fn noise_draws(&self) -> u64 {
+        self.noise.draws()
+    }
+
     pub fn new(drives: &[DriveType], ism_available: bool, base_frequency: Ticks) -> Self {
         Self::new_seeded(drives, ism_available, base_frequency, None)
     }

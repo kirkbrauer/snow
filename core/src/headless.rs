@@ -95,13 +95,14 @@ impl HeadlessPlus {
                 819200 => FloppyType::Mac800K,
                 _ => anyhow::bail!("Headless Plus requires raw 400/800 KB sector media"),
             };
-            let image = MacFormatEncoder::encode_with_noise(
+            let mut image = MacFormatEncoder::encode_with_noise(
                 format,
                 data,
                 None,
                 "boot",
                 Noise::seeded(seed ^ 0x4D45444941),
             )?;
+            image.clear_dirty();
             bus.swim.disk_insert(0, image)?;
         }
 
@@ -165,9 +166,19 @@ impl HeadlessPlus {
 
     /// Returns false when the OS has not initialized its absolute mouse globals.
     pub fn mouse_absolute(&mut self, x: u16, y: u16) -> bool {
-        self.cpu.bus.mouse_update_abs(x, y);
-        self.cpu.bus.ram[0x82C..0x82E] == y.to_be_bytes()
-            && self.cpu.bus.ram[0x82E..0x830] == x.to_be_bytes()
+        self.cpu.bus.try_mouse_update_abs(x, y)
+    }
+
+    /// Qualification counters: controller noise, drive noise, media-loading noise, dirty media.
+    /// Reading these values performs no controller or device bus reads.
+    pub fn media_activity(&self) -> (u64, [u64; 3], [u64; 3], [bool; 3]) {
+        let controller = &self.cpu.bus.swim;
+        (
+            controller.noise_draws(),
+            std::array::from_fn(|i| controller.drives[i].noise_draws()),
+            std::array::from_fn(|i| controller.drives[i].floppy.noise_draws()),
+            std::array::from_fn(|i| controller.drives[i].floppy.is_dirty()),
+        )
     }
 
     /// Canonical guest-state components. JSON objects are sorted before hashing;

@@ -296,6 +296,10 @@ impl FloppyImage {
     }
 
     /// Check if image was written to
+    pub fn noise_draws(&self) -> u64 {
+        self.noise.draws()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

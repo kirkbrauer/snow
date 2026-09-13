@@ -476,10 +476,15 @@ where
         self.mouse_mode = mode;
     }
 
-    /// Updates the mouse position (absolute coordinates)
+    /// Updates absolute mouse globals when Mac OS has initialized them.
     pub fn mouse_update_abs(&mut self, x: u16, y: u16) {
+        self.try_mouse_update_abs(x, y);
+    }
+
+    /// Updates the mouse position (absolute coordinates)
+    pub fn try_mouse_update_abs(&mut self, x: u16, y: u16) -> bool {
         if self.mouse_mode != MouseMode::Absolute {
-            return;
+            return false;
         }
 
         let old_x = self.read_ram::<u16>(Self::ADDR_RAWMOUSE_X);
@@ -488,7 +493,7 @@ where
         if !self.mouse_ready && (old_x != 15 || old_y != 15) {
             // Wait until the boot process has initialized the mouse position so we don't
             // interfere with the memory test.
-            return;
+            return false;
         }
         self.mouse_ready = true;
 
@@ -505,6 +510,7 @@ where
             self.write_ram(Self::ADDR_RAWMOUSE_Y, y);
         }
         self.write_ram(Self::ADDR_CRSRNEW, 1_u8);
+        true
     }
 
     /// Configures emulator speed

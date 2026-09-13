@@ -338,6 +338,10 @@ impl FloppyDrive {
         }
     }
 
+    pub fn noise_draws(&self) -> u64 {
+        self.noise.borrow().draws()
+    }
+
     /// Returns true if drive is present
     pub fn is_present(&self) -> bool {
         self.drive_type != DriveType::None
