@@ -94,7 +94,11 @@ impl Dc42Raw {
 pub struct Diskcopy42 {}
 
 impl FloppyImageLoader for Diskcopy42 {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let mut cursor = Cursor::new(data);
         let raw = Dc42Raw::read(&mut cursor)?;
         let title = if raw.name.is_empty() {
@@ -116,16 +120,22 @@ impl FloppyImageLoader for Diskcopy42 {
             #[cfg(feature = "fluxfox")]
             {
                 // Hand-off to Fluxfox
-                Fluxfox::load(&raw.data, filename)
+                Fluxfox::load_with_noise(&raw.data, filename, noise)
             }
             #[cfg(not(feature = "fluxfox"))]
             {
                 bail!("Requires fluxfox feature");
             }
         } else if raw.tags.is_empty() {
-            MacFormatEncoder::encode(floppytype, &raw.data, None, title)
+            MacFormatEncoder::encode_with_noise(floppytype, &raw.data, None, title, noise)
         } else {
-            MacFormatEncoder::encode(floppytype, &raw.data, Some(&raw.tags), title)
+            MacFormatEncoder::encode_with_noise(
+                floppytype,
+                &raw.data,
+                Some(&raw.tags),
+                title,
+                noise,
+            )
         }
     }
 }

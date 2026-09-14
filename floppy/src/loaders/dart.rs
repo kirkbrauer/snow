@@ -100,7 +100,11 @@ impl DartHeader {
 pub struct Dart {}
 
 impl FloppyImageLoader for Dart {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let mut cursor = Cursor::new(data);
         let header = DartHeader::read(&mut cursor)?;
 
@@ -178,14 +182,20 @@ impl FloppyImageLoader for Dart {
             #[cfg(feature = "fluxfox")]
             {
                 // Hand-off to Fluxfox
-                Fluxfox::load(&data, filename)
+                Fluxfox::load_with_noise(&data, filename, noise)
             }
             #[cfg(not(feature = "fluxfox"))]
             {
                 bail!("Requires fluxfox feature");
             }
         } else {
-            MacFormatEncoder::encode(floppytype, &data, Some(&tags), filename.unwrap_or_default())
+            MacFormatEncoder::encode_with_noise(
+                floppytype,
+                &data,
+                Some(&tags),
+                filename.unwrap_or_default(),
+                noise,
+            )
         }
     }
 }

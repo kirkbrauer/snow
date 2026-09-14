@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, ensure};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use snow_floppy::{FloppyType, macformat::MacFormatEncoder, noise::Noise};
+use snow_floppy::loaders::{Autodetect, FloppyImageLoader};
+use snow_floppy::noise::Noise;
+mod controls;
 
 use crate::cpu_m68k::regs::RegisterFile;
 use crate::emulator::{EmulatorConfig, MouseMode, comm::EmulatorSpeed, construct_config};
@@ -31,6 +33,7 @@ pub struct Frame {
 /// A directly owned Macintosh. All methods act synchronously at instruction boundaries.
 pub struct HeadlessMachine {
     config: EmulatorConfig,
+    cycle_offset: u64,
     scsi_media: Vec<(usize, std::sync::Arc<std::sync::Mutex<Vec<u8>>>)>,
     frames: Arc<Mutex<Option<DisplayBuffer>>>,
     frame_sequence: Arc<AtomicU64>,
@@ -138,23 +141,9 @@ impl HeadlessMachine {
         config.set_speed(EmulatorSpeed::Uncapped);
 
         if let Some(data) = disk {
-            let format = match data.len() {
-                409600 => FloppyType::Mac400K,
-                819200 => FloppyType::Mac800K,
-                _ => {
-                    anyhow::bail!("Headless floppy loading currently requires raw 400/800 KB media")
-                }
-            };
-            ensure!(
-                format != FloppyType::Mac800K
-                    || !matches!(model, MacModel::Early128K | MacModel::Early512K),
-                "This model's drive requires a 400 KB disk"
-            );
-            let mut image = MacFormatEncoder::encode_with_noise(
-                format,
+            let mut image = Autodetect::load_with_noise(
                 data,
-                None,
-                "boot",
+                Some("boot"),
                 Noise::seeded(seed ^ 0x4D45444941),
             )?;
             image.clear_dirty();
@@ -164,6 +153,7 @@ impl HeadlessMachine {
         config.cpu_sync_bus()?;
         Ok(Self {
             config,
+            cycle_offset: 0,
             frames,
             frame_sequence,
             last_frame: None,
@@ -175,7 +165,7 @@ impl HeadlessMachine {
         self.config.cpu_regs()
     }
     pub fn cycles(&self) -> u64 {
-        self.config.cpu_cycles()
+        self.cycle_offset + self.config.cpu_cycles()
     }
     pub fn ram(&self) -> &[u8] {
         self.config.ram()
@@ -306,6 +296,9 @@ impl HeadlessMachine {
             }
         }
         parts.insert("cpu".to_string(), cpu);
+        if self.cycle_offset != 0 {
+            parts.insert("cycle_offset".into(), Value::from(self.cycle_offset));
+        }
         parts.insert("bus".to_string(), bus);
         let mut result: BTreeMap<String, String> = parts
             .into_iter()
@@ -409,6 +402,62 @@ mod tests {
         assert_eq!(a.peek(0x400008), Some(0x60));
         assert_eq!(a.digests()?, before);
         assert_ne!(a.digests()?, machine(4)?.digests()?);
+        Ok(())
+    }
+
+    #[test]
+    fn debugger_edits_use_ram_mapping_and_refill_prefetch() -> Result<()> {
+        use crate::cpu_m68k::regs::Register;
+        let mut machine = machine(3)?;
+        let before = machine.digests()?;
+        for address in [0, 0x400008, 0x580000, 0xEFE1FF] {
+            assert_eq!(machine.ram_address(address), None);
+            assert_eq!(machine.write_memory_byte(address, 0xFF, false), None);
+        }
+        assert_eq!(before, machine.digests()?);
+        // With four MiB, Snow CPU reads $600000 from backing offset $200000.
+        // Resolve the inspection/read mapping rather than assuming an alias starts at zero.
+        let code = [0x70, 0x2A, 0x52, 0x80, 0x60, 0xFE];
+        for (offset, byte) in code.iter().enumerate() {
+            assert_eq!(
+                machine.write_memory_byte(0x200100 + offset as u32, *byte, true),
+                Some(())
+            );
+            assert_eq!(machine.peek(0x600100 + offset as u32), Some(*byte));
+        }
+        let cycle = machine.cycles();
+        machine.write_register(Register::PC, 0x600100)?;
+        assert!(machine.cycles() > cycle);
+        machine.step()?;
+        assert_eq!(machine.registers().d[0], 42);
+        machine.step()?;
+        assert_eq!(machine.registers().d[0], 43);
+        let cycle = machine.cycles();
+        machine.reset()?;
+        assert!(machine.cycles() > cycle);
+        assert_eq!(machine.registers().pc, 0x400008);
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_media_controls_are_private_and_repeatable() -> Result<()> {
+        let mut a = machine(3)?;
+        let mut b = machine(3)?;
+        let source = vec![0; 400 * 1024];
+        for machine in [&mut a, &mut b] {
+            machine.insert_floppy(0, &source, 42, false)?;
+            let exported = machine.export_floppy(0)?;
+            machine.eject_floppy(0)?;
+            machine.insert_floppy(0, &exported, 43, true)?;
+            machine.attach_scsi(2, vec![0x5A; 512])?;
+            assert_eq!(machine.export_scsi(2)?, vec![0x5A; 512]);
+            machine.detach_scsi(2)?;
+            machine.attach_cdrom(3, Some(vec![0; 2048]))?;
+            machine.floppy_rpm(0, 2)?;
+        }
+        assert_eq!(a.digests()?, b.digests()?);
+        assert_eq!(a.export_floppy(0)?, b.export_floppy(0)?);
+        assert!(source.iter().all(|byte| *byte == 0));
         Ok(())
     }
 

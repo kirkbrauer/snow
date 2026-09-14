@@ -277,6 +277,29 @@ where
             .extend(0..(self.ram.len() / crate::mac::compact::bus::RAM_DIRTY_PAGESIZE));
     }
 
+    /// Resolve the same physical/AMU view as safe inspection, excluding devices and ROM.
+    pub(crate) fn debugger_ram_address(&self, address: u32) -> Option<u32> {
+        let address = if AMU && self.amu_active {
+            self.amu_translate(address)
+        } else {
+            address
+        };
+        if address >= 0x40000000 || (self.overlay && !(AMU && self.amu_active)) {
+            return None;
+        }
+        let offset = address as usize & self.ram_mask;
+        (offset < self.ram.len()).then_some(offset as u32)
+    }
+
+    /// Debugger backing-RAM write, independent of the ROM overlay and MMIO.
+    pub(crate) fn debugger_write_ram(&mut self, address: u32, value: u8) -> Option<()> {
+        if address as usize >= self.ram.len() {
+            return None;
+        }
+        self.write_ram(address, value);
+        Some(())
+    }
+
     pub fn model(&self) -> MacModel {
         self.model
     }
@@ -962,14 +985,8 @@ where
     }
 
     fn inspect_write(&mut self, addr: Address, val: Byte) -> Option<()> {
-        // Everything up to 0x4FFFFFFF is safe (RAM/ROM only)
-        if addr >= 0x5000_0000 {
-            None
-        } else if self.overlay {
-            self.write_overlay(addr, val)
-        } else {
-            self.write_32bit(addr, val)
-        }
+        let offset = self.debugger_ram_address(addr)?;
+        self.debugger_write_ram(offset, val)
     }
 }
 

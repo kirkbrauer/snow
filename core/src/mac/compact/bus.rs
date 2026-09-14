@@ -230,6 +230,27 @@ where
             .extend(0..(self.ram.len() / RAM_DIRTY_PAGESIZE));
     }
 
+    /// Resolve only safely writable CPU-bus RAM, without touching devices or overlay.
+    pub(crate) fn debugger_ram_address(&self, address: u32) -> Option<u32> {
+        let offset = match (self.overlay, address) {
+            (true, 0x0060_0000..=0x007F_FFFF) => address as usize & self.ram_mask,
+            (false, 0..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF) => {
+                address as usize & self.ram_mask
+            }
+            _ => return None,
+        };
+        (offset < self.ram.len()).then_some(offset as u32)
+    }
+
+    /// Debugger backing-RAM write, independent of the ROM overlay and MMIO.
+    pub(crate) fn debugger_write_ram(&mut self, address: u32, value: u8) -> Option<()> {
+        if address as usize >= self.ram.len() {
+            return None;
+        }
+        self.write_normal(address, value);
+        Some(())
+    }
+
     pub fn model(&self) -> MacModel {
         self.model
     }
@@ -865,8 +886,10 @@ where
             | (false, 0x0040_0000..=0x004F_FFFF) => {
                 self.rom.get(addr as usize & self.rom_mask).copied()
             }
-            (true, 0x0060_0000..=0x007F_FFFF)
-            | (false, 0x0000_0000..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF) => {
+            (true, 0x0060_0000..=0x007F_FFFF) => {
+                self.ram.get(addr as usize & self.ram_mask).copied()
+            }
+            (false, 0x0000_0000..=0x003F_FFFF | 0x0060_0000..=0x006F_FFFF) => {
                 self.ram.get(addr as usize & self.ram_mask).copied()
             }
             _ => None,
@@ -874,14 +897,8 @@ where
     }
 
     fn inspect_write(&mut self, addr: Address, val: Byte) -> Option<()> {
-        // Everything up to 0x800000 is safe (RAM/ROM only)
-        if addr >= 0x80_0000 {
-            None
-        } else if self.overlay {
-            self.write_overlay(addr, val)
-        } else {
-            self.write_normal(addr, val)
-        }
+        let offset = self.debugger_ram_address(addr)?;
+        self.debugger_write_ram(offset, val)
     }
 }
 

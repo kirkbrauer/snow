@@ -169,7 +169,11 @@ impl Moof {
 }
 
 impl FloppyImageLoader for Moof {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let mut cursor = Cursor::new(data);
         let header = MoofHeader::read(&mut cursor)?;
         let checksum = Self::CHECKSUM.checksum(&data[12..]);
@@ -221,11 +225,12 @@ impl FloppyImageLoader for Moof {
             .copied()
             .unwrap_or_else(|| filename.unwrap_or_default());
 
-        let mut img = FloppyImage::new_empty(
+        let mut img = FloppyImage::new_with_noise(
             info.disktype
                 .try_into()
                 .context(format!("Unsupported disk type: {:?}", info.disktype))?,
             title,
+            noise,
         );
 
         // Fill metadata

@@ -13,7 +13,11 @@ use strum::IntoEnumIterator;
 pub struct RawImage {}
 
 impl FloppyImageLoader for RawImage {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let Some(floppytype) = FloppyType::iter().find(|t| t.get_logical_size() == data.len())
         else {
             bail!("Invalid raw image length: {}", data.len())
@@ -23,14 +27,20 @@ impl FloppyImageLoader for RawImage {
             #[cfg(feature = "fluxfox")]
             {
                 // Hand-off to Fluxfox
-                Fluxfox::load(data, filename)
+                Fluxfox::load_with_noise(data, filename, noise)
             }
             #[cfg(not(feature = "fluxfox"))]
             {
                 bail!("Requires fluxfox feature");
             }
         } else {
-            MacFormatEncoder::encode(floppytype, data, None, filename.unwrap_or_default())
+            MacFormatEncoder::encode_with_noise(
+                floppytype,
+                data,
+                None,
+                filename.unwrap_or_default(),
+                noise,
+            )
         }
     }
 }

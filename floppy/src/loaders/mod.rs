@@ -48,7 +48,16 @@ pub fn extension_has_saver(ext: &std::ffi::OsStr) -> bool {
 
 /// A loader to read a specific format and transform it into a usable FloppyImage
 pub trait FloppyImageLoader {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage>;
+    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+        Self::load_with_noise(data, filename, crate::noise::Noise::default())
+    }
+
+    /// Load with a caller-owned generator for padding, empty tracks, and later weak bits.
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage>;
 
     fn load_file(filename: &str) -> Result<FloppyImage> {
         Self::load(

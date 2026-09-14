@@ -69,7 +69,11 @@ struct PayloadTrack {
 pub struct PRI {}
 
 impl FloppyImageLoader for PRI {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let mut cursor = Cursor::new(data);
 
         let mut tracks: HashMap<(usize, usize), (usize, &[u8])> = HashMap::new();
@@ -154,13 +158,14 @@ impl FloppyImageLoader for PRI {
             cursor.seek(SeekFrom::Start(startpos + u64::from(chunk.size) + 4))?;
         }
 
-        let mut img = FloppyImage::new_empty(
+        let mut img = FloppyImage::new_with_noise(
             if tracks.keys().any(|&(s, _t)| s > 0) {
                 FloppyType::Mac800K
             } else {
                 FloppyType::Mac400K
             },
             filename.unwrap_or_default(),
+            noise,
         );
 
         // Fill tracks

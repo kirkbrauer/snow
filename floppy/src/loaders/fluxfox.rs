@@ -22,7 +22,11 @@ impl Fluxfox {
 }
 
 impl FloppyImageLoader for Fluxfox {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let mut cursor = Cursor::new(data);
         let image = DiskImage::load(&mut cursor, None, None, None)?;
 
@@ -45,7 +49,7 @@ impl FloppyImageLoader for Fluxfox {
             ),
         };
 
-        let mut img = FloppyImage::new_empty(floppytype, filename.unwrap_or_default());
+        let mut img = FloppyImage::new_with_noise(floppytype, filename.unwrap_or_default(), noise);
 
         // Fill tracks
         for tch in image.track_ch_iter() {

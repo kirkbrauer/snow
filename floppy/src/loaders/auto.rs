@@ -131,22 +131,26 @@ impl Autodetect {
 }
 
 impl FloppyImageLoader for Autodetect {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         match Self::detect(data)? {
-            ImageType::A2R2 => A2Rv2::load(data, filename),
-            ImageType::A2R3 => A2Rv3::load(data, filename),
-            ImageType::Bitfile => Bitfile::load(data, filename),
-            ImageType::DART => Dart::load(data, filename),
-            ImageType::DC42 => Diskcopy42::load(data, filename),
-            ImageType::MOOF => Moof::load(data, filename),
-            ImageType::PFI => PFI::load(data, filename),
-            ImageType::PRI => PRI::load(data, filename),
-            ImageType::Raw => RawImage::load(data, filename),
+            ImageType::A2R2 => A2Rv2::load_with_noise(data, filename, noise),
+            ImageType::A2R3 => A2Rv3::load_with_noise(data, filename, noise),
+            ImageType::Bitfile => Bitfile::load_with_noise(data, filename, noise),
+            ImageType::DART => Dart::load_with_noise(data, filename, noise),
+            ImageType::DC42 => Diskcopy42::load_with_noise(data, filename, noise),
+            ImageType::MOOF => Moof::load_with_noise(data, filename, noise),
+            ImageType::PFI => PFI::load_with_noise(data, filename, noise),
+            ImageType::PRI => PRI::load_with_noise(data, filename, noise),
+            ImageType::Raw => RawImage::load_with_noise(data, filename, noise),
 
             ImageType::Fluxfox => {
                 #[cfg(feature = "fluxfox")]
                 {
-                    Fluxfox::load(data, filename)
+                    Fluxfox::load_with_noise(data, filename, noise)
                 }
                 #[cfg(not(feature = "fluxfox"))]
                 {

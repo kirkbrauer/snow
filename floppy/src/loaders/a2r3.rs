@@ -147,7 +147,11 @@ impl A2Rv3 {
 }
 
 impl FloppyImageLoader for A2Rv3 {
-    fn load(data: &[u8], filename: Option<&str>) -> Result<FloppyImage> {
+    fn load_with_noise(
+        data: &[u8],
+        filename: Option<&str>,
+        noise: crate::noise::Noise,
+    ) -> Result<FloppyImage> {
         let mut cursor = Cursor::new(data);
         let _header = A2RHeader::read(&mut cursor)?;
 
@@ -205,13 +209,14 @@ impl FloppyImageLoader for A2Rv3 {
             .copied()
             .unwrap_or_else(|| filename.unwrap_or_default());
 
-        let mut img = FloppyImage::new_empty(
+        let mut img = FloppyImage::new_with_noise(
             if captures.iter().any(|c| c.get_side() > 0) {
                 FloppyType::Mac800K
             } else {
                 FloppyType::Mac400K
             },
             title,
+            noise,
         );
 
         // Fill metadata
