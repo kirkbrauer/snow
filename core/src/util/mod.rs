@@ -1,5 +1,6 @@
 pub mod lossyinto;
 pub mod mac;
+pub mod scrap;
 
 use std::ops::{Mul, SubAssign};
 use std::path::Path;
