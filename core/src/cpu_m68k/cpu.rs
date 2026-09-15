@@ -296,6 +296,15 @@ pub struct SystrapHistoryEntry {
     pub pc: Address,
 }
 
+/// Actual A-line dispatch during one observed CPU step, before exception entry.
+/// Independent of breakpoints, history recording and safe instruction-memory reads.
+#[derive(Clone)]
+pub struct TrapObservation {
+    pub opcode: Word,
+    pub cycles: Ticks,
+    pub registers: RegisterFile,
+}
+
 /// Motorola 680x0
 #[derive(Serialize, Deserialize)]
 pub struct CpuM68k<
@@ -356,6 +365,11 @@ pub struct CpuM68k<
     history_total: u64,
     #[serde(skip)]
     systrap_history_total: u64,
+
+    #[serde(skip)]
+    observe_traps: bool,
+    #[serde(skip)]
+    observed_trap: Option<TrapObservation>,
 
     /// Next address to jump to for step over
     step_over_addr: Option<Address>,
@@ -451,6 +465,8 @@ where
             breakpoint_hits_dropped: 0,
             history_total: 0,
             systrap_history_total: 0,
+            observe_traps: false,
+            observed_trap: None,
             step_over_addr: None,
             history: VecDeque::with_capacity(Self::HISTORY_SIZE),
             history_current: HistoryEntryInstruction::default(),
@@ -478,6 +494,7 @@ where
 
     /// Resets the CPU, loads reset vector and initial SP
     pub fn reset(&mut self) -> Result<()> {
+        self.observed_trap = None;
         self.regs = RegisterFile::new();
         self.icache_tags.fill(ICACHE_TAG_INVALID);
 
@@ -749,10 +766,22 @@ where
 
     /// Executes a single CPU step.
     pub fn step(&mut self) -> Result<()> {
+        self.observed_trap = None;
         self.debug_instruction_pc = Some(self.regs.pc);
         let result = self.step_instruction();
         self.debug_instruction_pc = None;
         result
+    }
+
+    /// Execute normally, returning this step's actual A-line entry if one occurred.
+    /// Failed steps do not return a successful observation; no history or stops are added.
+    pub fn step_observed(&mut self) -> Result<Option<TrapObservation>> {
+        self.observe_traps = true;
+        let result = self.step();
+        self.observe_traps = false;
+        let observation = self.observed_trap.take();
+        result?;
+        Ok(observation)
     }
 
     fn step_instruction(&mut self) -> Result<()> {
@@ -1539,6 +1568,14 @@ where
             InstructionMnemonic::ROL_ea => self.op_shrot_ea(instr, Self::alu_rol),
             InstructionMnemonic::ROR_ea => self.op_shrot_ea(instr, Self::alu_ror),
             InstructionMnemonic::LINEA => {
+                if self.observe_traps {
+                    self.observed_trap = Some(TrapObservation {
+                        opcode: instr.data,
+                        cycles: self.cycles,
+                        registers: self.regs.clone(),
+                    });
+                }
+
                 if self.breakpoints.contains(&Breakpoint::LineA(instr.data)) {
                     info!(
                         "Breakpoint hit (LINEA): ${:04X}, PC: ${:08X}",

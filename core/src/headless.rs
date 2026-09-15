@@ -195,9 +195,31 @@ impl HeadlessMachine {
 
     /// One CPU instruction, with device clocks synchronized before returning.
     pub fn step(&mut self) -> Result<()> {
-        let result = self.config.cpu_step();
+        self.step_inner(false).map(|_| ())
+    }
+
+    /// Execute normally and retain the actual pre-exception A-line caller, if any.
+    /// Observation does not enable history or add a breakpoint. Cycles use this
+    /// owner's monotonic clock, including prior resets.
+    pub fn step_observed(&mut self) -> Result<Option<crate::cpu_m68k::cpu::TrapObservation>> {
+        self.step_inner(true)
+    }
+
+    fn step_inner(
+        &mut self,
+        observe: bool,
+    ) -> Result<Option<crate::cpu_m68k::cpu::TrapObservation>> {
+        let result = if observe {
+            self.config.cpu_step_observed()
+        } else {
+            self.config.cpu_step().map(|()| None)
+        };
         self.config.cpu_sync_bus()?;
-        result?;
+        let mut observation = result?;
+
+        if let Some(trap) = &mut observation {
+            trap.cycles += self.cycle_offset;
+        }
         let sequence = self.frame_sequence.load(Ordering::Relaxed);
         if sequence > self.last_frame.as_ref().map_or(0, |f| f.sequence) {
             let buffer = self
@@ -215,7 +237,7 @@ impl HeadlessMachine {
                 });
             }
         }
-        Ok(())
+        Ok(observation)
     }
 
     pub fn key(&mut self, event: KeyEvent) {
@@ -474,6 +496,68 @@ mod tests {
         assert_eq!(a.digests()?, b.digests()?);
         assert_eq!(a.export_floppy(0)?, b.export_floppy(0)?);
         assert!(source.iter().all(|byte| *byte == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_traps_use_executed_prefetch_without_history_or_hidden_stops() -> Result<()> {
+        use crate::cpu_m68k::regs::Register;
+
+        let mut rom = vec![0; 128 * 1024];
+        rom[..8].copy_from_slice(&[0x00, 0x6f, 0xff, 0x00, 0x00, 0x40, 0x01, 0x00]);
+        rom[0x28..0x2c].copy_from_slice(&0x0040_0200u32.to_be_bytes());
+        rom[0x100..0x102].copy_from_slice(&[0x60, 0xfe]);
+        // Original dispatcher: advance the stacked PC by two, then return.
+        rom[0x200..0x206].copy_from_slice(&[0x54, 0xaf, 0x00, 0x02, 0x4e, 0x73]);
+
+        let mut observed = HeadlessMachine::new(&rom, None, 42, 0, &[0; 256], MouseMode::Disabled)?;
+        let mut control = HeadlessMachine::new(&rom, None, 42, 0, &[0; 256], MouseMode::Disabled)?;
+
+        for machine in [&mut observed, &mut control] {
+            for (offset, byte) in [0xa1, 0x22, 0x60, 0xfe].into_iter().enumerate() {
+                assert_eq!(
+                    machine.write_memory_byte(0x200100 + offset as u32, byte, true),
+                    Some(())
+                );
+            }
+
+            machine.write_register(Register::Dn(0), 37)?;
+            machine.write_register(Register::PC, 0x600100)?;
+            // Safe RAM writes do not replace the already fetched A122.
+            assert_eq!(machine.write_memory_byte(0x200100, 0xa0, true), Some(()));
+            assert_eq!(machine.write_memory_byte(0x200101, 0x23, true), Some(()));
+        }
+
+        let start = observed.cycles();
+        let caller_stack = observed.registers().read_a::<u32>(7);
+        let trap = observed
+            .step_observed()?
+            .expect("Expected actual A-line dispatch");
+
+        control.step()?;
+
+        assert_eq!(trap.opcode, 0xa122);
+        assert_eq!(trap.registers.pc, 0x600100);
+        assert_eq!(trap.registers.d[0], 37);
+        assert_eq!(trap.registers.read_a::<u32>(7), caller_stack);
+        assert!(trap.cycles >= start && trap.cycles <= observed.cycles());
+        assert_eq!(observed.peek(0x600101), Some(0x23));
+        assert_eq!(observed.digests()?, control.digests()?);
+        assert_eq!(observed.take_breakpoint_hits(), (vec![], 0));
+        assert!(observed.instruction_history().is_none());
+        assert!(observed.trap_history().is_none());
+
+        for _ in 0..3 {
+            assert!(observed.step_observed()?.is_none());
+            control.step()?;
+            assert_eq!(observed.digests()?, control.digests()?);
+        }
+
+        observed.reset()?;
+        control.reset()?;
+        assert!(observed.step_observed()?.is_none());
+        control.step()?;
+        assert_eq!(observed.digests()?, control.digests()?);
         Ok(())
     }
 

@@ -212,7 +212,7 @@ mod media_tests {
         assert!(machine.insert_floppy(1, &[0; 16], 1, false).is_err());
         assert_eq!(machine.digests()?, before);
         machine.eject_floppy(1)?;
-        assert_eq!(machine.floppy_status(1)?.1, false);
+        assert!(!machine.floppy_status(1)?.1);
         assert_eq!(machine.export_floppy(1)?, image);
         assert!(machine.insert_floppy(3, &[0; 16], 1, false).is_err());
         Ok(())

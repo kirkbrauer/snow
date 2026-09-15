@@ -221,6 +221,7 @@ dispatch! {
         fn cpu_prefetch_refill(&mut self) -> Result<()> { prefetch_refill() }
         fn cpu_take_breakpoint_hits(&mut self) -> (Vec<crate::cpu_m68k::cpu::BreakpointHit>, u64) { take_breakpoint_hits() }
         fn cpu_step(&mut self) -> Result<()> { step() }
+        fn cpu_step_observed(&mut self) -> Result<Option<crate::cpu_m68k::cpu::TrapObservation>> { step_observed() }
         fn cpu_inspect_translation(&mut self, query: crate::cpu_m68k::pmmu::inspect::TranslationQuery) -> Result<crate::cpu_m68k::pmmu::inspect::TranslationInspection> { inspect_translation(query) }
         fn cpu_sync_bus(&mut self) -> Result<()> { sync_bus() }
         fn try_mouse_update_abs(&mut self, x: u16, y: u16) -> bool { bus.try_mouse_update_abs(x, y) }
