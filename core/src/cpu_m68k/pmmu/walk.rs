@@ -50,10 +50,22 @@ impl WalkFailure {
     }
 }
 
+/// Which address-space or logical-address field selects a descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescriptorIndex {
+    FunctionCode,
+    TableA,
+    TableB,
+    TableC,
+    TableD,
+}
+
 /// Evidence for one descriptor, before any execution-side U/M updates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorStep {
     pub level: u8,
+    pub index_source: DescriptorIndex,
     pub index: u32,
     pub address: u32,
     pub width: u8,
@@ -113,15 +125,16 @@ impl TableWalk {
     }
 }
 
-/// This matches Snow's existing A/B/C/D walker. TC.FCL is not implemented.
+/// Walk the optional F level followed by A/B/C/D, using the same effects policy.
 pub(super) fn walk_tables(
     memory: &mut impl WalkMemory,
     tc: TcReg,
     root: RootPointerReg,
     logical: u32,
+    function_code: u8,
 ) -> TableWalk {
     let mut evidence = TableWalk {
-        descriptors: Vec::with_capacity(4),
+        descriptors: Vec::with_capacity(5),
         level: 0,
         resolved: None,
         failure: None,
@@ -142,7 +155,8 @@ pub(super) fn walk_tables(
 
     let mut descriptor_type = Dt::from_u8(root.dt()).expect("two-bit descriptor type");
     let mut table_address = root.table_addr() << 4;
-    let mut limit = Some(IndexLimit {
+    // MC68030 UM 9.7.2 and MC68851 UM 6.1.3.3: FCL suppresses the root limit.
+    let mut limit = (!tc.fcl()).then_some(IndexLimit {
         value: root.limit(),
         lower: root.lu(),
     });
@@ -160,17 +174,33 @@ pub(super) fn walk_tables(
         return evidence;
     }
 
-    for (level, bits) in indices.into_iter().enumerate() {
+    let fields = [
+        (DescriptorIndex::FunctionCode, 0),
+        (DescriptorIndex::TableA, tc.tia()),
+        (DescriptorIndex::TableB, tc.tib()),
+        (DescriptorIndex::TableC, tc.tic()),
+        (DescriptorIndex::TableD, tc.tid()),
+    ];
+
+    for (level, (index_source, bits)) in fields
+        .into_iter()
+        .filter(|(source, _)| tc.fcl() || *source != DescriptorIndex::FunctionCode)
+        .enumerate()
+    {
         evidence.level = (level + 1) as u8;
 
-        if bits == 0 {
+        if bits == 0 && index_source != DescriptorIndex::FunctionCode {
             evidence.fail(WalkFailureKind::DepthExceeded, Some(table_address),
                 "A table descriptor requires another nonzero index; indirect descriptors are unsupported");
             return evidence;
         }
 
         consumed += u32::from(bits);
-        let index = shifted >> (32 - bits);
+        let index = if index_source == DescriptorIndex::FunctionCode {
+            u32::from(function_code & 7)
+        } else {
+            shifted >> (32 - bits)
+        };
 
         if let Some(bound) = limit {
             let invalid = if bound.lower {
@@ -225,6 +255,7 @@ pub(super) fn walk_tables(
 
         evidence.descriptors.push(DescriptorStep {
             level: evidence.level,
+            index_source,
             index,
             address,
             width,
@@ -281,7 +312,7 @@ pub(super) fn walk_tables(
     evidence.fail(
         WalkFailureKind::DepthExceeded,
         Some(table_address),
-        "Table search exceeds Snow's four descriptor levels",
+        "Table search exceeds F/A/B/C/D descriptor levels",
     );
     evidence
 }

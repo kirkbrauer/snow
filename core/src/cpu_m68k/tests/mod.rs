@@ -2,6 +2,7 @@ mod group2_exceptions;
 mod illegal_exception;
 mod interrupt;
 mod pmmu_atc;
+mod pmmu_fidelity;
 mod pmmu_inspection;
 mod privilege_violation;
 mod privilege_violation_68020;

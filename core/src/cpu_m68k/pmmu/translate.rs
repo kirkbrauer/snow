@@ -83,6 +83,8 @@ pub(in crate::cpu_m68k) fn atc_generation_default() -> u32 {
 /// A resolved Address Translation Cache entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::cpu_m68k) struct PmmuAtcEntry {
+    /// Full CPU function code. A colliding code replaces this software cache slot.
+    pub function_code: u8,
     /// Physical page base address (low PS bits are zero).
     pub paddr: Address,
     /// Write-protect bit inherited from any table descriptor on the walk
@@ -289,9 +291,14 @@ where
         &self,
         atc: usize,
         key: usize,
+        function_code: u8,
     ) -> Option<PmmuAtcEntry> {
         match self.pmmu_atc[atc][key] {
-            Some(e) if e.generation == self.pmmu_atc_generation => Some(e),
+            Some(e)
+                if e.generation == self.pmmu_atc_generation && e.function_code == function_code =>
+            {
+                Some(e)
+            }
             _ => None,
         }
     }
@@ -335,11 +342,11 @@ where
             if (fc & fc_care) != (tt.fc_base() & fc_care) {
                 continue;
             }
-            // R/W: rwm=1 means R/W is don't-care, otherwise rw must be ok
-            if !tt.rwm() && writing != tt.rw() {
+            // MC68030 UM 9.7.3: R/W=1 means read; RWM=1 ignores direction.
+            if !tt.rwm() && writing == tt.rw() {
                 continue;
             }
-            // Address (top 3 bytes are don't care)
+            // Address comparison uses only the top byte; low 24 bits are ignored.
             let addr_care = !tt.le_mask() & 0xFF;
             if ((vaddr >> 24) & addr_care) != (tt.le_base() & addr_care) {
                 continue;
@@ -356,6 +363,12 @@ where
         writing: bool,
     ) -> Result<Address> {
         if !PMMU {
+            return Ok(vaddr);
+        }
+
+        // CPU-space cycles do not use translation tables (MC68030 UM 9.2.1,
+        // MC68851 UM 4.2.3.5). Coprocessor register decoding belongs to the CPU/bus.
+        if fc == 7 {
             return Ok(vaddr);
         }
 
@@ -385,7 +398,7 @@ where
         let is_mask = Address::MAX.unbounded_shl(32 - self.regs.pmmu.tc.is());
         let page_mask = (1u32 << self.regs.pmmu.tc.ps()) - 1;
         let cache_key = ((vaddr & !is_mask) >> self.regs.pmmu.tc.ps()) as usize;
-        if let Some(entry) = self.pmmu_atc_lookup(atc, cache_key) {
+        if let Some(entry) = self.pmmu_atc_lookup(atc, cache_key, fc) {
             if !supervisor && entry.s {
                 self.pmmu_record_atc_fault(
                     fc,
@@ -428,6 +441,7 @@ where
             self.pmmu_translate_lookup::<false>(fc, vaddr, writing)?;
         let cache_key = ((vaddr & !is_mask) >> self.regs.pmmu.tc.ps()) as usize;
         self.pmmu_atc[atc][cache_key] = Some(PmmuAtcEntry {
+            function_code: fc,
             paddr: paddr & !page_mask,
             wp,
             s,
@@ -503,7 +517,8 @@ where
         ]
         .iter()
         .filter(|&&bits| bits > 0)
-        .count() as u8;
+        .count() as u8
+            + u8::from(self.regs.pmmu.tc.fcl());
         self.regs.pmmu.psr = RegisterPSR::default();
 
         if kind == WalkFailureKind::SupervisorOnly {
@@ -584,7 +599,7 @@ where
             mutate: !PTEST,
             error: None,
         };
-        let walk = super::walk::walk_tables(&mut reader, tc, rootptr, vaddr);
+        let walk = super::walk::walk_tables(&mut reader, tc, rootptr, vaddr, fc);
         let level = walk.level;
 
         if let Some(failure) = &walk.failure {
@@ -740,11 +755,13 @@ mod tests {
 
     fn sample_entry(paddr: Address) -> PmmuAtcEntry {
         PmmuAtcEntry {
+            function_code: 5,
             paddr,
             wp: true,
             s: false,
             leaf_desc_addr: paddr + 0x10,
             modified: true,
+            generation: 1,
         }
     }
 

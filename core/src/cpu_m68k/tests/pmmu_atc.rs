@@ -17,6 +17,7 @@ fn testcpu() -> TestCpu {
 
 fn entry(cpu: &TestCpu, paddr: Address) -> PmmuAtcEntry {
     PmmuAtcEntry {
+        function_code: 5,
         paddr,
         wp: false,
         s: false,
@@ -34,16 +35,16 @@ fn flush_invalidates_by_generation() {
     let e = entry(&cpu, 0x0020_0000);
     cpu.pmmu_atc[PMMU_ATC_SRP][KEY] = Some(e);
 
-    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY), Some(e));
+    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY, 5), Some(e));
 
     cpu.pmmu_cache_invalidate();
-    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY), None);
+    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY, 5), None);
     assert!(cpu.pmmu_atc[PMMU_ATC_SRP][KEY].is_some(),);
 
     // Refilling the slot in the current generation makes it usable again
     let e2 = entry(&cpu, 0x0040_0000);
     cpu.pmmu_atc[PMMU_ATC_SRP][KEY] = Some(e2);
-    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY), Some(e2));
+    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY, 5), Some(e2));
 }
 
 #[test]
@@ -53,11 +54,11 @@ fn generation_wraparound_clears_the_tables() {
 
     let e = entry(&cpu, 0x0020_0000);
     cpu.pmmu_atc[PMMU_ATC_SRP][KEY] = Some(e);
-    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY), Some(e));
+    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY, 5), Some(e));
 
     cpu.pmmu_cache_invalidate();
 
     assert_eq!(cpu.pmmu_atc_generation, 1);
     assert_eq!(cpu.pmmu_atc[PMMU_ATC_SRP][KEY], None);
-    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY), None);
+    assert_eq!(cpu.pmmu_atc_lookup(PMMU_ATC_SRP, KEY, 5), None);
 }

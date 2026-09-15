@@ -23,6 +23,7 @@ pub enum TranslationMode {
 #[serde(rename_all = "snake_case")]
 pub enum TranslationRoute {
     NoMmu,
+    CpuSpace,
     Disabled,
     Transparent,
     Atc,
@@ -48,6 +49,7 @@ pub struct TranslationQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtcSlot {
     pub bank: RootBank,
+    pub function_code: u8,
     pub index: usize,
     /// Logical page interpreted using the current TC; IS aliases are not expanded.
     pub logical_page: u32,
@@ -214,19 +216,14 @@ where
             return Ok(result);
         }
 
-        if tc.fcl() {
-            result.limitations.push(
-                "Snow ignores TC.FCL and does not perform a function-code lookup level".into(),
-            );
+        if query.function_code == 7 {
+            result.route = TranslationRoute::CpuSpace;
+            result.limitations.push("CPU-space cycles bypass page translation; Snow's address-only bus mapping does not model external MC68851 coprocessor-register cycle decoding".into());
+            return Ok(result);
         }
-        result.limitations.push("Snow's software ATC is indexed by root bank and logical page, not physical-chip ATC organization".into());
 
-        if self.regs.pmmu.tt.iter().any(|tt| tt.e() && !tt.rwm()) {
-            result.limitations.push(
-                "Snow's transparent R/W match is inverted relative to hardware when RWM is clear"
-                    .into(),
-            );
-        }
+        result.limitations.push("Snow's software ATC keeps one function-code-tagged entry per root bank and logical page; a different function code replaces that slot, unlike the physical chip's ATC organization".into());
+        result.limitations.push("Transparent matching describes individual reads/writes; locked read-modify-write cycle qualification and MMUSR.T via PTEST remain unimplemented".into());
 
         if let Some(index) = self.pmmu_tt_index(query.function_code, query.address, query.writing) {
             result.route = TranslationRoute::Transparent;
@@ -257,11 +254,17 @@ where
         let key = ((query.address & !ignored_mask) >> tc.ps()) as usize;
         result.cached = self.inspection_atc_slot(bank_index, key);
         let mut reader = InspectionMemory { bus: &mut self.bus };
-        let tables = walk_tables(&mut reader, tc, root_pointer, query.address);
+        let tables = walk_tables(
+            &mut reader,
+            tc,
+            root_pointer,
+            query.address,
+            query.function_code,
+        );
         let cached_page = result
             .cached
             .as_ref()
-            .filter(|slot| slot.valid)
+            .filter(|slot| slot.valid && slot.function_code == query.function_code)
             .map(|slot| ResolvedPage {
                 physical_address: slot.physical_page | (query.address & ((1 << tc.ps()) - 1)),
                 offset_bits: tc.ps(),
@@ -298,7 +301,7 @@ where
                     "Requested access is rejected by inherited page protection",
                 );
                 failure.level = if result.route == TranslationRoute::Atc {
-                    indices.iter().filter(|&&bits| bits > 0).count() as u8
+                    indices.iter().filter(|&&bits| bits > 0).count() as u8 + u8::from(tc.fcl())
                 } else {
                     tables.level
                 };
@@ -335,6 +338,7 @@ where
     fn inspection_atc_slot(&self, bank: usize, index: usize) -> Option<AtcSlot> {
         let entry = self.pmmu_atc.get(bank)?.get(index)?.as_ref()?;
         Some(AtcSlot {
+            function_code: entry.function_code,
             bank: if bank == 0 {
                 RootBank::Cpu
             } else {
