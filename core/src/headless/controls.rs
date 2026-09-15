@@ -70,7 +70,20 @@ impl HeadlessMachine {
         write_protect: bool,
     ) -> Result<()> {
         ensure!(drive < 3, "Floppy drive must be 0..2");
+        let unit = &self.config.swim().drives[drive];
+        ensure!(unit.is_present(), "Floppy drive is unavailable");
+        ensure!(
+            !unit.floppy_inserted,
+            "Eject the current floppy before insertion"
+        );
         let mut image = Autodetect::load_with_noise(bytes, Some("inserted"), Noise::seeded(seed))?;
+        use snow_floppy::Floppy;
+        ensure!(
+            unit.drive_type
+                .compatible_floppies()
+                .contains(&image.get_type()),
+            "Floppy format is incompatible with this drive"
+        );
         if write_protect {
             image.set_force_wp();
         }
@@ -79,8 +92,26 @@ impl HeadlessMachine {
     }
     pub fn eject_floppy(&mut self, drive: usize) -> Result<()> {
         ensure!(drive < 3, "Floppy drive must be 0..2");
+        ensure!(
+            self.config.swim().drives[drive].is_present()
+                && self.config.swim().drives[drive].floppy_inserted,
+            "No inserted floppy in this drive"
+        );
         self.config.swim_mut().drives[drive].eject();
         Ok(())
+    }
+    /// Safe stopped-state drive observation: present, inserted, dirty, write protected.
+    /// An ejected image remains available to export until the next insertion.
+    pub fn floppy_status(&self, drive: usize) -> Result<(bool, bool, bool, bool)> {
+        use snow_floppy::Floppy;
+        ensure!(drive < 3, "Floppy drive must be 0..2");
+        let unit = &self.config.swim().drives[drive];
+        Ok((
+            unit.is_present(),
+            unit.floppy_inserted,
+            unit.floppy.is_dirty(),
+            unit.floppy.get_write_protect(),
+        ))
     }
     pub fn export_floppy(&self, drive: usize) -> Result<Vec<u8>> {
         ensure!(
@@ -159,5 +190,31 @@ impl HeadlessMachine {
                 .into_iter()
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+
+    #[test]
+    fn floppy_lifecycle_preserves_ejected_image_and_rejects_replacement() -> Result<()> {
+        let mut rom = vec![0; 128 * 1024];
+        rom[..4].copy_from_slice(&0x1fffc_u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&8_u32.to_be_bytes());
+        rom[8..10].copy_from_slice(&[0x60, 0xfe]);
+        let mut machine = HeadlessMachine::new(&rom, None, 1, 0, &[0; 256], MouseMode::RelativeHw)?;
+        assert!(machine.eject_floppy(1).is_err());
+        machine.insert_floppy(1, &vec![0; 400 * 1024], 7, true)?;
+        assert_eq!(machine.floppy_status(1)?, (true, true, false, true));
+        let before = machine.digests()?;
+        let image = machine.export_floppy(1)?;
+        assert!(machine.insert_floppy(1, &[0; 16], 1, false).is_err());
+        assert_eq!(machine.digests()?, before);
+        machine.eject_floppy(1)?;
+        assert_eq!(machine.floppy_status(1)?.1, false);
+        assert_eq!(machine.export_floppy(1)?, image);
+        assert!(machine.insert_floppy(3, &[0; 16], 1, false).is_err());
+        Ok(())
     }
 }
