@@ -2,14 +2,71 @@ use crate::bus::{Address, Bus, IrqSource};
 use crate::cpu_m68k::CpuM68kType;
 use crate::cpu_m68k::FpuM68kType;
 use crate::cpu_m68k::cpu::{CpuError, CpuM68k, Group0Details, HistoryEntry, PagefaultCause};
-use crate::cpu_m68k::pmmu::regs::{PmmuPageDescriptorType, RegisterPSR, RootPointerReg};
+use crate::cpu_m68k::pmmu::regs::{RegisterPSR, RootPointerReg};
 use crate::types::Long;
 
 use anyhow::{Result, anyhow, bail};
-use arrayvec::ArrayVec;
-use num_traits::FromPrimitive;
 use proc_bitfield::bitfield;
 use serde::{Deserialize, Serialize};
+
+use super::inspect::{FaultSignal, RootBank, TranslationFault, TranslationRoute};
+use super::walk::{TableWalk, WalkFailure, WalkFailureKind, WalkMemory};
+
+struct ExecutingWalk<
+    'a,
+    TBus,
+    const MASK: Address,
+    const CPU: CpuM68kType,
+    const FPU: FpuM68kType,
+    const MMU: bool,
+> where
+    TBus: Bus<Address, u8> + IrqSource,
+{
+    cpu: &'a mut CpuM68k<TBus, MASK, CPU, FPU, MMU>,
+    mutate: bool,
+    error: Option<anyhow::Error>,
+}
+
+impl<TBus, const MASK: Address, const CPU: CpuM68kType, const FPU: FpuM68kType, const MMU: bool>
+    WalkMemory for ExecutingWalk<'_, TBus, MASK, CPU, FPU, MMU>
+where
+    TBus: Bus<Address, u8> + IrqSource,
+{
+    fn select_descriptor(&mut self, address: u32) {
+        self.cpu.regs.pmmu.last_desc = address;
+    }
+
+    fn read_long(&mut self, address: u32) -> Result<u32, WalkFailure> {
+        self.cpu
+            .read_ticks_physical::<Long>(address)
+            .map_err(|error| {
+                let failure = WalkFailure::new(
+                    WalkFailureKind::UnreadableDescriptor,
+                    Some(address),
+                    error.to_string(),
+                );
+                self.error = Some(error);
+                failure
+            })
+    }
+
+    fn mark_used(&mut self, address: u32, original: u32) -> Result<(), WalkFailure> {
+        if self.mutate {
+            self.cpu
+                .write_ticks_physical::<Long>(address, original | 8)
+                .map_err(|error| {
+                    let failure = WalkFailure::new(
+                        WalkFailureKind::DescriptorUpdate,
+                        Some(address),
+                        error.to_string(),
+                    );
+                    self.error = Some(error);
+                    failure
+                })?;
+        }
+        Ok(())
+    }
+}
 
 /// Index in CpuM68k::pmmu_atc tables when URP is in use
 pub(in crate::cpu_m68k) const PMMU_ATC_URP: usize = 0;
@@ -17,22 +74,6 @@ pub(in crate::cpu_m68k) const PMMU_ATC_URP: usize = 0;
 pub(in crate::cpu_m68k) const PMMU_ATC_SRP: usize = 1;
 /// Number of ATC tables in CpuM68k::pmmu_atc (one per root pointer)
 pub(in crate::cpu_m68k) const PMMU_ATCS: usize = 2;
-
-/// Result of a successful page-table walk.
-#[derive(Debug, Clone, Copy)]
-struct PmmuWalkResult {
-    /// Physical page base address shifted to include the in-page offset bits.
-    page_addr: Address,
-    /// Write-protected (inherited down the walk or set on the leaf).
-    wp: bool,
-    /// Supervisor-only (inherited from any long-format descriptor on the walk).
-    /// Short-format descriptors have no S bit and contribute nothing.
-    s: bool,
-    /// Physical address of the leaf page descriptor.
-    leaf_desc_addr: Address,
-    /// Value of the M (modified) bit in the leaf descriptor.
-    modified: bool,
-}
 
 pub(in crate::cpu_m68k) fn atc_generation_default() -> u32 {
     // 0 is reserved for unused entries
@@ -256,7 +297,7 @@ where
     }
 
     #[inline(always)]
-    fn pmmu_rootptr(&self, fc: u8) -> RootPointerReg {
+    pub(super) fn pmmu_rootptr(&self, fc: u8) -> RootPointerReg {
         // M68851 manual 5.1.4.2
         // + Table 3-1, M68000 Family Function Code Assignments
         //
@@ -269,7 +310,7 @@ where
     }
 
     #[inline(always)]
-    fn pmmu_atc_tableidx(&self, fc: u8) -> usize {
+    pub(super) fn pmmu_atc_tableidx(&self, fc: u8) -> usize {
         // M68851 manual 5.1.4.2
         // + Table 3-1, M68000 Family Function Code Assignments
         //
@@ -281,206 +322,11 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn pmmu_fetch_table(
-        &mut self,
-        vaddr: Address,
-        table_addr: Address,
-        dt: PmmuPageDescriptorType,
-        parent_limit: Option<(u16, bool)>,
-        tis: &mut ArrayVec<u8, 4>,
-        used_bits: &mut Address,
-        wp: bool,
-        s: bool,
-        mutate: bool,
-    ) -> Result<PmmuWalkResult> {
-        match dt {
-            PmmuPageDescriptorType::Valid4b => self.pmmu_fetch_table_short(
-                vaddr,
-                table_addr,
-                parent_limit,
-                tis,
-                used_bits,
-                wp,
-                s,
-                mutate,
-            ),
-            PmmuPageDescriptorType::Valid8b => self.pmmu_fetch_table_long(
-                vaddr,
-                table_addr,
-                parent_limit,
-                tis,
-                used_bits,
-                wp,
-                s,
-                mutate,
-            ),
-            _ => bail!("Unimplemented DT {:?}", dt),
-        }
-    }
-
-    fn pmmu_check_limit(idx: Address, parent_limit: Option<(u16, bool)>) -> Result<()> {
-        if let Some((limit, lu)) = parent_limit {
-            let limit = limit as Address;
-            let violation = if lu { idx < limit } else { idx > limit };
-            if violation {
-                bail!(CpuError::Pagefault(PagefaultCause::LimitViolation));
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn pmmu_fetch_table_short(
-        &mut self,
-        vaddr: Address,
-        table_addr: Address,
-        parent_limit: Option<(u16, bool)>,
-        tis: &mut ArrayVec<u8, 4>,
-        used_bits: &mut Address,
-        wp: bool,
-        s: bool,
-        mutate: bool,
-    ) -> Result<PmmuWalkResult> {
-        let Some(ti) = tis.pop() else {
-            bail!("PMMU table search beyond maximum depth");
-        };
-        *used_bits += ti as Address;
-
-        // Table index
-        let idx = vaddr >> (32 - ti);
-        Self::pmmu_check_limit(idx, parent_limit)?;
-        let entry_addr = table_addr.wrapping_add(idx * 4);
-
-        self.regs.pmmu.last_desc = entry_addr;
-
-        let entry_word = self.read_ticks_physical::<Long>(entry_addr)?;
-        let child_dt = PmmuPageDescriptorType::from_u32(entry_word & 0b11).unwrap();
-        match child_dt {
-            PmmuPageDescriptorType::Invalid => {
-                bail!(CpuError::Pagefault(PagefaultCause::Invalid));
-            }
-            PmmuPageDescriptorType::PageDescriptor => {
-                let entry = PmmuShortPageDescriptor(entry_word);
-                // Mark U on first successful use, so the OS can tell this leaf
-                // has been referenced. PTEST must not mutate descriptors.
-                if mutate && !entry.u() {
-                    self.write_ticks_physical::<Long>(entry_addr, entry_word | (1 << 3))?;
-                }
-                Ok(PmmuWalkResult {
-                    page_addr: entry.page_addr() << 8,
-                    wp: wp | entry.wp(),
-                    // Short format has no S bit; pass the accumulator through unchanged
-                    s,
-                    leaf_desc_addr: entry_addr,
-                    modified: entry.m(),
-                })
-            }
-            PmmuPageDescriptorType::Valid4b | PmmuPageDescriptorType::Valid8b => {
-                // Recurse to child
-                let entry = PmmuShortTableDescriptor(entry_word);
-                // Set U on the table descriptor we just walked through
-                if mutate && !entry.u() {
-                    self.write_ticks_physical::<Long>(entry_addr, entry_word | (1 << 3))?;
-                }
-                self.pmmu_fetch_table(
-                    vaddr << ti,
-                    entry.table_addr() << 4,
-                    child_dt,
-                    // Short table descriptors have no limit field
-                    None,
-                    tis,
-                    used_bits,
-                    // WP is inherited from any ancestor table
-                    wp | entry.wp(),
-                    s,
-                    mutate,
-                )
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn pmmu_fetch_table_long(
-        &mut self,
-        vaddr: Address,
-        table_addr: Address,
-        parent_limit: Option<(u16, bool)>,
-        tis: &mut ArrayVec<u8, 4>,
-        used_bits: &mut Address,
-        wp: bool,
-        s: bool,
-        mutate: bool,
-    ) -> Result<PmmuWalkResult> {
-        let Some(ti) = tis.pop() else {
-            bail!("PMMU table search beyond maximum depth");
-        };
-        *used_bits += ti as Address;
-
-        // Table index
-        let idx = vaddr >> (32 - ti);
-        Self::pmmu_check_limit(idx, parent_limit)?;
-        let entry_addr = table_addr.wrapping_add(idx * 8);
-
-        self.regs.pmmu.last_desc = entry_addr;
-
-        let entry_word1 = self.read_ticks_physical::<Long>(entry_addr)?;
-        let entry_word2 = self.read_ticks_physical::<Long>(entry_addr + 4)?;
-
-        let child_dt = PmmuPageDescriptorType::from_u32(entry_word1 & 0b11).unwrap();
-        match child_dt {
-            PmmuPageDescriptorType::Invalid => {
-                bail!(CpuError::Pagefault(PagefaultCause::Invalid));
-            }
-            PmmuPageDescriptorType::PageDescriptor => {
-                let entry = PmmuLongPageDescriptor(0)
-                    .with_msl(entry_word1)
-                    .with_lsl(entry_word2);
-                // U lives in the MSL (bit 35 of the u64 = bit 3 of MSL), so
-                // only the first longword of the descriptor needs rewriting.
-                if mutate && !entry.u() {
-                    self.write_ticks_physical::<Long>(entry_addr, entry_word1 | (1 << 3))?;
-                }
-                Ok(PmmuWalkResult {
-                    page_addr: entry.page_addr() << 8,
-                    wp: wp | entry.wp(),
-                    s: s | entry.s(),
-                    leaf_desc_addr: entry_addr,
-                    modified: entry.m(),
-                })
-            }
-            PmmuPageDescriptorType::Valid4b | PmmuPageDescriptorType::Valid8b => {
-                // Recurse to child
-                let entry = PmmuLongTableDescriptor(0)
-                    .with_msl(entry_word1)
-                    .with_lsl(entry_word2);
-                if mutate && !entry.u() {
-                    self.write_ticks_physical::<Long>(entry_addr, entry_word1 | (1 << 3))?;
-                }
-                self.pmmu_fetch_table(
-                    vaddr << ti,
-                    entry.table_addr() << 4,
-                    child_dt,
-                    // Long table descriptors carry a limit constraining the
-                    // child table's index
-                    Some((entry.limit(), entry.lu())),
-                    tis,
-                    used_bits,
-                    // WP is inherited from any ancestor table
-                    wp | entry.wp(),
-                    // S is inherited from any long-format ancestor
-                    s | entry.s(),
-                    mutate,
-                )
-            }
-        }
-    }
-
     /// Returns true if any enabled TT register transparently maps this access.
     /// TT regions bypass the page tables and the ATC entirely.
     #[inline]
-    fn pmmu_tt_match(&self, fc: u8, vaddr: Address, writing: bool) -> bool {
-        for tt in &self.regs.pmmu.tt {
+    pub(super) fn pmmu_tt_index(&self, fc: u8, vaddr: Address, writing: bool) -> Option<usize> {
+        for (index, tt) in self.regs.pmmu.tt.iter().enumerate() {
             if !tt.e() {
                 continue;
             }
@@ -498,9 +344,9 @@ where
             if ((vaddr >> 24) & addr_care) != (tt.le_base() & addr_care) {
                 continue;
             }
-            return true;
+            return Some(index);
         }
-        false
+        None
     }
 
     pub(in crate::cpu_m68k) fn pmmu_translate(
@@ -515,7 +361,7 @@ where
 
         // Transparent translation runs even when TC.E=0; TT regions are
         // identity-mapped and bypass the page tables and the ATC.
-        if self.pmmu_tt_match(fc, vaddr, writing) {
+        if self.pmmu_tt_index(fc, vaddr, writing).is_some() {
             return Ok(vaddr);
         }
 
@@ -541,22 +387,35 @@ where
         let cache_key = ((vaddr & !is_mask) >> self.regs.pmmu.tc.ps()) as usize;
         if let Some(entry) = self.pmmu_atc_lookup(atc, cache_key) {
             if !supervisor && entry.s {
-                self.pmmu_record_atc_fault(vaddr, writing, |psr| {
-                    psr.set_supervisor_violation(true);
-                });
+                self.pmmu_record_atc_fault(
+                    fc,
+                    vaddr,
+                    writing,
+                    WalkFailureKind::SupervisorOnly,
+                    entry.leaf_desc_addr,
+                );
                 return Err(Self::pmmu_pagefault_to_buserror(fc, vaddr, writing));
             }
             if writing && entry.wp {
-                self.pmmu_record_atc_fault(vaddr, writing, |psr| {
-                    psr.set_write_protected(true);
-                });
+                self.pmmu_record_atc_fault(
+                    fc,
+                    vaddr,
+                    writing,
+                    WalkFailureKind::WriteProtected,
+                    entry.leaf_desc_addr,
+                );
                 return Err(Self::pmmu_pagefault_to_buserror(fc, vaddr, writing));
             }
             if writing && !entry.modified {
                 // First write through an unmodified page: RMW the leaf
                 // descriptor to set the M bit, then promote the ATC entry.
-                let desc = self.read_ticks_physical::<Long>(entry.leaf_desc_addr)?;
-                self.write_ticks_physical::<Long>(entry.leaf_desc_addr, desc | (1 << 4))?;
+                self.mark_translation_modified(
+                    fc,
+                    vaddr,
+                    entry.leaf_desc_addr,
+                    TranslationRoute::Atc,
+                    0,
+                )?;
                 self.pmmu_atc[atc][cache_key] = Some(PmmuAtcEntry {
                     modified: true,
                     ..entry
@@ -579,37 +438,89 @@ where
         Ok(paddr)
     }
 
-    /// Records a page-fault history entry if history recording is enabled.
-    fn pmmu_record_pagefault(&mut self, vaddr: Address, writing: bool) {
+    /// Captures the original attempt before exception entry can replace its context.
+    fn record_mmu_fault(
+        &mut self,
+        fc: u8,
+        vaddr: u32,
+        writing: bool,
+        route: TranslationRoute,
+        failure: WalkFailure,
+        tables: Option<&TableWalk>,
+    ) {
         if self.history_enabled {
+            let detail = TranslationFault {
+                signal: match failure.kind {
+                    WalkFailureKind::InvalidConfiguration
+                    | WalkFailureKind::UnsupportedRoot
+                    | WalkFailureKind::DepthExceeded => FaultSignal::BackendFailure,
+                    WalkFailureKind::UnreadableDescriptor | WalkFailureKind::DescriptorUpdate => {
+                        FaultSignal::TableAccessFailure
+                    }
+                    _ => FaultSignal::PageFault,
+                },
+                address: vaddr,
+                function_code: fc,
+                writing,
+                instruction_pc: self.debug_instruction_pc,
+                pc_at_attempt: self.regs.pc,
+                cycle: self.cycles,
+                sr: self.regs.sr.0,
+                status: self.regs.pmmu.psr.0,
+                tc: self.regs.pmmu.tc.0,
+                root: if self.pmmu_atc_tableidx(fc) == 0 {
+                    RootBank::Cpu
+                } else {
+                    RootBank::Supervisor
+                },
+                root_pointer: self.pmmu_rootptr(fc).0,
+                cache_generation: self.pmmu_atc_generation,
+                route,
+                failure,
+                tables: tables.cloned(),
+            };
             self.push_history(HistoryEntry::Pagefault {
                 address: vaddr,
                 write: writing,
+                detail: Box::new(detail),
             });
         }
     }
 
-    /// Set PSR for a failure during ATC lookup
     fn pmmu_record_atc_fault(
         &mut self,
-        vaddr: Address,
+        fc: u8,
+        vaddr: u32,
         writing: bool,
-        set_cause: impl FnOnce(&mut RegisterPSR),
+        kind: WalkFailureKind,
+        descriptor: u32,
     ) {
-        let leaf_level = [
+        let level = [
             self.regs.pmmu.tc.tia(),
             self.regs.pmmu.tc.tib(),
             self.regs.pmmu.tc.tic(),
             self.regs.pmmu.tc.tid(),
         ]
         .iter()
-        .filter(|&&x| x > 0)
+        .filter(|&&bits| bits > 0)
         .count() as u8;
         self.regs.pmmu.psr = RegisterPSR::default();
-        set_cause(&mut self.regs.pmmu.psr);
-        self.regs.pmmu.psr.set_level_number(leaf_level);
+
+        if kind == WalkFailureKind::SupervisorOnly {
+            self.regs.pmmu.psr.set_supervisor_violation(true);
+        } else {
+            self.regs.pmmu.psr.set_write_protected(true);
+        }
+
+        self.regs.pmmu.psr.set_level_number(level);
         self.regs.pmmu.psr.set_bus_error(true);
-        self.pmmu_record_pagefault(vaddr, writing);
+        let mut failure = WalkFailure::new(
+            kind,
+            Some(descriptor),
+            "Cached page protection rejects the access",
+        );
+        failure.level = level;
+        self.record_mmu_fault(fc, vaddr, writing, TranslationRoute::Atc, failure, None);
     }
 
     /// Builds the Group-0 BusError stack frame error value for a page fault.
@@ -623,6 +534,31 @@ where
             start_pc: 0,
             size: 0,
         }))
+    }
+
+    fn mark_translation_modified(
+        &mut self,
+        fc: u8,
+        vaddr: u32,
+        descriptor: u32,
+        route: TranslationRoute,
+        level: u8,
+    ) -> Result<()> {
+        let result = self
+            .read_ticks_physical::<Long>(descriptor)
+            .and_then(|word| self.write_ticks_physical::<Long>(descriptor, word | 16));
+
+        if let Err(error) = &result {
+            let mut failure = WalkFailure::new(
+                WalkFailureKind::DescriptorUpdate,
+                Some(descriptor),
+                error.to_string(),
+            );
+            failure.level = level;
+            self.record_mmu_fault(fc, vaddr, true, route, failure, None);
+        }
+
+        result
     }
 
     /// Perform address translation by performing a page table lookup.
@@ -642,67 +578,80 @@ where
             self.regs.pmmu.last_desc = 0;
         }
 
-        let mut tis = ArrayVec::from([
-            self.regs.pmmu.tc.tid(),
-            self.regs.pmmu.tc.tic(),
-            self.regs.pmmu.tc.tib(),
-            self.regs.pmmu.tc.tia(),
-        ]);
-        let mut used_bits = self.regs.pmmu.tc.is() as Address;
-        let walk = self
-            .pmmu_fetch_table(
-                vaddr << self.regs.pmmu.tc.is(),
-                rootptr.table_addr() << 4,
-                PmmuPageDescriptorType::from_u8(rootptr.dt()).unwrap(),
-                // Root pointer always carries a limit (15 bits, LU bit)
-                Some((rootptr.limit(), rootptr.lu())),
-                &mut tis,
-                &mut used_bits,
-                false,
-                false,
-                !PTEST,
-            )
-            .map_err(|e| match e.downcast_ref() {
-                Some(CpuError::AddressError(ae)) => {
-                    anyhow!("Address error while reading page tables: {:X?}", ae)
-                }
-                Some(CpuError::Pagefault(cause)) => {
-                    let cause = *cause;
-                    if !PTEST {
-                        self.regs.pmmu.psr = RegisterPSR::default();
-                    }
-                    match cause {
-                        PagefaultCause::Invalid => self.regs.pmmu.psr.set_invalid(true),
-                        PagefaultCause::WriteProtected => {
-                            self.regs.pmmu.psr.set_write_protected(true);
-                        }
-                        PagefaultCause::SupervisorOnly => {
-                            self.regs.pmmu.psr.set_supervisor_violation(true);
-                        }
-                        PagefaultCause::LimitViolation => {
-                            self.regs.pmmu.psr.set_limit_violation(true);
-                        }
-                    }
-                    self.regs.pmmu.psr.set_level_number((4 - tis.len()) as u8);
-                    if PTEST {
-                        // Raise basic error rather than full bus error frame for PTEST
-                        e
-                    } else {
-                        self.regs.pmmu.psr.set_bus_error(true);
-                        self.pmmu_record_pagefault(vaddr, writing);
-                        Self::pmmu_pagefault_to_buserror(fc, vaddr, writing)
-                    }
-                }
-                _ => e,
-            });
+        let tc = self.regs.pmmu.tc;
+        let mut reader = ExecutingWalk {
+            cpu: self,
+            mutate: !PTEST,
+            error: None,
+        };
+        let walk = super::walk::walk_tables(&mut reader, tc, rootptr, vaddr);
+        let level = walk.level;
 
-        let PmmuWalkResult {
-            page_addr,
-            wp,
-            s,
-            leaf_desc_addr,
-            mut modified,
-        } = walk?;
+        if let Some(failure) = &walk.failure {
+            if let Some(error) = reader.error.take() {
+                if !PTEST {
+                    self.record_mmu_fault(
+                        fc,
+                        vaddr,
+                        writing,
+                        TranslationRoute::Table,
+                        failure.clone(),
+                        Some(&walk),
+                    );
+                }
+                return Err(error);
+            }
+
+            let cause = match failure.kind {
+                super::walk::WalkFailureKind::InvalidDescriptor => PagefaultCause::Invalid,
+                super::walk::WalkFailureKind::LimitViolation => PagefaultCause::LimitViolation,
+                _ => {
+                    if !PTEST {
+                        self.record_mmu_fault(
+                            fc,
+                            vaddr,
+                            writing,
+                            TranslationRoute::Table,
+                            failure.clone(),
+                            Some(&walk),
+                        );
+                    }
+                    bail!("{}", failure.detail);
+                }
+            };
+
+            if !PTEST {
+                self.regs.pmmu.psr = RegisterPSR::default();
+            }
+
+            match cause {
+                PagefaultCause::Invalid => self.regs.pmmu.psr.set_invalid(true),
+                PagefaultCause::LimitViolation => self.regs.pmmu.psr.set_limit_violation(true),
+                _ => unreachable!(),
+            }
+            self.regs.pmmu.psr.set_level_number(level);
+
+            if PTEST {
+                return Err(anyhow!(CpuError::Pagefault(cause)));
+            }
+
+            self.regs.pmmu.psr.set_bus_error(true);
+            self.record_mmu_fault(
+                fc,
+                vaddr,
+                writing,
+                TranslationRoute::Table,
+                failure.clone(),
+                Some(&walk),
+            );
+            return Err(Self::pmmu_pagefault_to_buserror(fc, vaddr, writing));
+        }
+
+        let page = walk.resolved.expect("successful walk contains a page");
+        let wp = page.write_protected;
+        let s = page.supervisor_only;
+        let leaf_desc_addr = page.leaf_address;
+        let mut modified = page.modified;
 
         // Enforce supervisor-only access on the resolved page
         let supervisor = fc & (1 << 2) != 0;
@@ -711,12 +660,25 @@ where
                 self.regs.pmmu.psr = RegisterPSR::default();
             }
             self.regs.pmmu.psr.set_supervisor_violation(true);
-            self.regs.pmmu.psr.set_level_number((4 - tis.len()) as u8);
+            self.regs.pmmu.psr.set_level_number(level);
             if PTEST {
                 return Err(anyhow!(CpuError::Pagefault(PagefaultCause::SupervisorOnly)));
             } else {
                 self.regs.pmmu.psr.set_bus_error(true);
-                self.pmmu_record_pagefault(vaddr, writing);
+                let mut failure = WalkFailure::new(
+                    WalkFailureKind::SupervisorOnly,
+                    Some(leaf_desc_addr),
+                    "Inherited supervisor protection rejects the access",
+                );
+                failure.level = level;
+                self.record_mmu_fault(
+                    fc,
+                    vaddr,
+                    writing,
+                    TranslationRoute::Table,
+                    failure,
+                    Some(&walk),
+                );
                 return Err(Self::pmmu_pagefault_to_buserror(fc, vaddr, writing));
             }
         }
@@ -727,12 +689,25 @@ where
                 self.regs.pmmu.psr = RegisterPSR::default();
             }
             self.regs.pmmu.psr.set_write_protected(true);
-            self.regs.pmmu.psr.set_level_number((4 - tis.len()) as u8);
+            self.regs.pmmu.psr.set_level_number(level);
             if PTEST {
                 return Err(anyhow!(CpuError::Pagefault(PagefaultCause::WriteProtected)));
             } else {
                 self.regs.pmmu.psr.set_bus_error(true);
-                self.pmmu_record_pagefault(vaddr, writing);
+                let mut failure = WalkFailure::new(
+                    WalkFailureKind::WriteProtected,
+                    Some(leaf_desc_addr),
+                    "Inherited write protection rejects the access",
+                );
+                failure.level = level;
+                self.record_mmu_fault(
+                    fc,
+                    vaddr,
+                    writing,
+                    TranslationRoute::Table,
+                    failure,
+                    Some(&walk),
+                );
                 return Err(Self::pmmu_pagefault_to_buserror(fc, vaddr, writing));
             }
         }
@@ -740,16 +715,20 @@ where
         // Set M on the leaf descriptor on first write. PTEST never mutates the
         // tables; only real translations do.
         if !PTEST && writing && !modified {
-            let desc = self.read_ticks_physical::<Long>(leaf_desc_addr)?;
-            self.write_ticks_physical::<Long>(leaf_desc_addr, desc | (1 << 4))?;
+            self.mark_translation_modified(
+                fc,
+                vaddr,
+                leaf_desc_addr,
+                TranslationRoute::Table,
+                level,
+            )?;
             modified = true;
         }
 
-        let mask = 0xFFFFFFFFu32.unbounded_shr(used_bits);
-        let paddr = (page_addr & !mask) | (vaddr & mask);
+        let paddr = page.physical_address;
 
         if PTEST {
-            self.regs.pmmu.psr.set_level_number((4 - tis.len()) as u8);
+            self.regs.pmmu.psr.set_level_number(level);
         }
         Ok((paddr, wp, s, leaf_desc_addr, modified))
     }

@@ -256,8 +256,15 @@ pub const ICACHE_OFFSET_MASK: Address = 0x000_0003;
 #[allow(clippy::large_enum_variant)]
 pub enum HistoryEntry {
     Instruction(HistoryEntryInstruction),
-    Exception { vector: Address, cycles: Ticks },
-    Pagefault { address: Address, write: bool },
+    Exception {
+        vector: Address,
+        cycles: Ticks,
+    },
+    Pagefault {
+        address: Address,
+        write: bool,
+        detail: Box<crate::cpu_m68k::pmmu::inspect::TranslationFault>,
+    },
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -389,6 +396,10 @@ pub struct CpuM68k<
     #[serde(default = "crate::cpu_m68k::pmmu::translate::atc_generation_default")]
     pub(in crate::cpu_m68k) pmmu_atc_generation: u32,
 
+    /// Debug provenance for translations attempted while executing one instruction.
+    #[serde(skip)]
+    pub(in crate::cpu_m68k) debug_instruction_pc: Option<Address>,
+
     /// 68020+ I-cache lines
     #[serde(with = "BigArray")]
     icache_lines: [[u8; ICACHE_LINE_SIZE]; ICACHE_LINES],
@@ -448,6 +459,7 @@ where
             systrap_history_enabled: false,
             pmmu_atc: Default::default(),
             pmmu_atc_generation: atc_generation_default(),
+            debug_instruction_pc: None,
             icache_lines: core::array::from_fn(|_| Default::default()),
             icache_tags: [ICACHE_TAG_INVALID; ICACHE_LINES],
             restart_regs: None,
@@ -737,6 +749,13 @@ where
 
     /// Executes a single CPU step.
     pub fn step(&mut self) -> Result<()> {
+        self.debug_instruction_pc = Some(self.regs.pc);
+        let result = self.step_instruction();
+        self.debug_instruction_pc = None;
+        result
+    }
+
+    fn step_instruction(&mut self) -> Result<()> {
         debug_assert_eq!(self.prefetch.len(), 2);
 
         self.sync_bus()?;

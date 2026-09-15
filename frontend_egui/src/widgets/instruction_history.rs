@@ -85,7 +85,7 @@ impl InstructionHistoryWidget {
                 HistoryEntry::Exception { vector, .. } => {
                     writeln!(f, "--- {}", self.text_exception(*vector))?;
                 }
-                HistoryEntry::Pagefault { address, write } => {
+                HistoryEntry::Pagefault { address, write, .. } => {
                     writeln!(f, "--- {}", self.text_pagefault(*address, *write))?;
                 }
             }
@@ -202,7 +202,7 @@ impl InstructionHistoryWidget {
                         HistoryEntry::Instruction(entry) => {
                             self.row_instruction(history, row_height, row_idx, ui, entry);
                         }
-                        HistoryEntry::Pagefault { address, write } => {
+                        HistoryEntry::Pagefault { address, write, .. } => {
                             self.row_pagefault(history, row_height, row_idx, ui, *address, *write);
                         }
                     }

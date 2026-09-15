@@ -193,6 +193,7 @@ dispatch! {
     immutable_calls {
         fn model(&self) -> MacModel { bus.model() }
         fn cpu_has_pmmu(&self) -> bool { has_pmmu() }
+        fn cpu_inspect_atc(&self, start: usize, scan_limit: usize, entry_limit: usize) -> Result<crate::cpu_m68k::pmmu::inspect::AtcPage> { inspect_atc(start, scan_limit, entry_limit) }
         fn cpu_history_status(&self) -> (bool, u64, bool, u64, usize) { history_status() }
         fn cpu_cycles(&self) -> Ticks { cycles }
         fn cpu_breakpoints(&self) -> &[Breakpoint] { breakpoints() }
@@ -220,6 +221,7 @@ dispatch! {
         fn cpu_prefetch_refill(&mut self) -> Result<()> { prefetch_refill() }
         fn cpu_take_breakpoint_hits(&mut self) -> (Vec<crate::cpu_m68k::cpu::BreakpointHit>, u64) { take_breakpoint_hits() }
         fn cpu_step(&mut self) -> Result<()> { step() }
+        fn cpu_inspect_translation(&mut self, query: crate::cpu_m68k::pmmu::inspect::TranslationQuery) -> Result<crate::cpu_m68k::pmmu::inspect::TranslationInspection> { inspect_translation(query) }
         fn cpu_sync_bus(&mut self) -> Result<()> { sync_bus() }
         fn try_mouse_update_abs(&mut self, x: u16, y: u16) -> bool { bus.try_mouse_update_abs(x, y) }
         fn cpu_reset(&mut self) -> Result<()> { reset() }

@@ -173,6 +173,22 @@ impl HeadlessMachine {
     pub fn peek(&mut self, address: u32) -> Option<u8> {
         self.config.bus_inspect_read(address)
     }
+    /// Explain translation and compare cached mappings with current tables without guest effects.
+    pub fn inspect_translation(
+        &mut self,
+        query: crate::cpu_m68k::pmmu::inspect::TranslationQuery,
+    ) -> Result<crate::cpu_m68k::pmmu::inspect::TranslationInspection> {
+        self.config.cpu_inspect_translation(query)
+    }
+    /// Inspect a bounded page of valid and flushed software ATC slots.
+    pub fn inspect_atc(
+        &self,
+        start: usize,
+        scan_limit: usize,
+        entry_limit: usize,
+    ) -> Result<crate::cpu_m68k::pmmu::inspect::AtcPage> {
+        self.config.cpu_inspect_atc(start, scan_limit, entry_limit)
+    }
     pub fn frame(&self) -> Option<&Frame> {
         self.last_frame.as_ref()
     }
@@ -544,6 +560,59 @@ mod tests {
             machine.peek(0x5001_0000);
             assert_eq!(machine.digests()?, before, "{model}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn mmu_inspection_rejects_device_descriptors_without_guest_changes() -> Result<()> {
+        use crate::cpu_m68k::pmmu::inspect::{TranslationMode, TranslationQuery};
+        use crate::cpu_m68k::pmmu::regs::{RootPointerReg, TcReg};
+        use crate::cpu_m68k::pmmu::walk::WalkFailureKind;
+
+        let mut rom = vec![0; 256 * 1024];
+        rom[..4].copy_from_slice(&0x0001_FFFCu32.to_be_bytes());
+        rom[4..8].copy_from_slice(&8u32.to_be_bytes());
+        rom[8..10].copy_from_slice(&[0x60, 0xFE]);
+        let video = vec![0; 64 * 1024];
+
+        for model in [MacModel::MacII, MacModel::MacIIx] {
+            let mut machine = HeadlessMachine::new_model(HeadlessConfig {
+                rom: &rom,
+                extra_roms: &[ExtraROMs::MDC12(&video)],
+                model,
+                ram_bytes: model.ram_size_options()[0],
+                pmmu: true,
+                disk: None,
+                seed: 1,
+                seconds: 0,
+                pram: &[0; 256],
+                mouse: MouseMode::RelativeHw,
+            })?;
+            machine.configure_history(true, true);
+            let registers = machine.config.cpu_regs_mut();
+            registers.pmmu.tc = TcReg(0x80C8_6600);
+            registers.pmmu.crp = RootPointerReg(0x7FFF_0002_5000_0000);
+            let before = machine.digests()?;
+            let cycles = machine.cycles();
+            let history = machine.history_status();
+
+            let result = machine.inspect_translation(TranslationQuery {
+                address: 0x403006,
+                function_code: 5,
+                writing: false,
+                mode: TranslationMode::CacheAware,
+            })?;
+
+            assert_eq!(
+                result.failure.unwrap().kind,
+                WalkFailureKind::UnreadableDescriptor
+            );
+            assert!(machine.inspect_atc(0, 32, 16)?.entries.is_empty());
+            assert_eq!(machine.digests()?, before);
+            assert_eq!(machine.cycles(), cycles);
+            assert_eq!(machine.history_status(), history);
+        }
+
         Ok(())
     }
 }
