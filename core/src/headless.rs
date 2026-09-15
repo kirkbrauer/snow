@@ -478,6 +478,43 @@ mod tests {
     }
 
     #[test]
+    fn reset_overlay_calls_preserve_stack_and_return_with_four_megabytes() -> Result<()> {
+        use crate::cpu_m68k::regs::Register;
+
+        let mut machine = machine(3)?;
+        // Original JSR Helper; NOP; Helper: MOVEQ #42,D6; RTS.
+        let code = [0x4e, 0xba, 0, 4, 0x4e, 0x71, 0x7c, 42, 0x4e, 0x75];
+
+        for (offset, byte) in code.into_iter().enumerate() {
+            assert_eq!(
+                machine.write_memory_byte(0x600100 + offset as u32, byte, false),
+                Some(())
+            );
+        }
+
+        machine.write_register(Register::An(7), 0x60ff00)?;
+        machine.write_register(Register::PC, 0x600100)?;
+        machine.step()?;
+
+        assert_eq!(machine.registers().pc, 0x600106);
+        assert_eq!(
+            &machine.ram()[0x20fefc..0x20ff00],
+            &0x00600104u32.to_be_bytes()
+        );
+        assert_eq!(&machine.ram()[0xfefc..0xff00], &[0; 4]);
+        assert_eq!(machine.peek(0x60fefd), Some(0x60));
+
+        machine.step()?;
+        machine.step()?;
+
+        assert_eq!(machine.registers().d[6], 42);
+        assert_eq!(machine.registers().pc, 0x600104);
+        assert_eq!(machine.registers().read_a::<u32>(7), 0x60ff00);
+
+        Ok(())
+    }
+
+    #[test]
     fn seeded_media_controls_are_private_and_repeatable() -> Result<()> {
         let mut a = machine(3)?;
         let mut b = machine(3)?;

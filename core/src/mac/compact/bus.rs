@@ -311,7 +311,9 @@ where
             0x0058_0000..=0x005F_FFFF if self.model.has_scsi() => self.scsi.write(addr, val),
             // RAM
             0x0060_0000..=0x007F_FFFF => {
-                let idx = ((addr as usize) - 0x60_0000) & self.ram_mask;
+                // Preserve the same RAM address bits as reads and safe inspection.
+                // Subtracting the overlay base drops A21 with four MiB installed.
+                let idx = addr as usize & self.ram_mask;
                 self.ram_dirty.insert(idx / RAM_DIRTY_PAGESIZE);
                 Some(self.ram[idx] = val)
             }
