@@ -1,3 +1,4 @@
+mod debugger;
 mod group2_exceptions;
 mod illegal_exception;
 mod interrupt;

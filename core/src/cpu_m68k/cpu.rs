@@ -1058,13 +1058,6 @@ where
         });
     }
 
-    /// Gets the location where the next fetch() would occur from,
-    /// regardless of the prefetch queue.
-    fn get_fetch_addr(&self) -> Address {
-        let prefetch_offset = (2 - self.prefetch.len()) as Address;
-        self.regs.pc.wrapping_add(prefetch_offset * 2) & ADDRESS_MASK
-    }
-
     /// Raises an illegal instruction exception
     fn raise_illegal_instruction(&mut self) -> Result<()> {
         // "If the instruction is not executed because the instruction is illegal or privileged,
@@ -2970,17 +2963,19 @@ where
             _ => (),
         };
 
-        self.step_over_addr = Some(self.get_fetch_addr());
+        // The prefetch cursor can be beyond the sequential return address.
+        // Use the same boundary that JSR puts on the guest stack.
+        let return_pc = self.regs.pc.wrapping_add(2) & ADDRESS_MASK;
+        self.step_over_addr = Some(return_pc);
 
         // Execute the jump
-        let old_pc = self.regs.pc;
         self.set_pc(pc)?;
         self.prefetch_pump()?;
 
         if instr.mnemonic == InstructionMnemonic::JSR {
             // Push return address to the stack
             let sp = self.regs.read_a_predec(7, 4);
-            self.write_ticks(sp, old_pc.wrapping_add(2) & ADDRESS_MASK)?;
+            self.write_ticks(sp, return_pc)?;
         }
 
         self.prefetch_refill()?;
@@ -3245,7 +3240,7 @@ where
                 };
                 self.write_ticks(addr, stack_pc)?;
 
-                self.step_over_addr = Some(self.get_fetch_addr());
+                self.step_over_addr = Some(stack_pc & ADDRESS_MASK);
             }
             let pc = self
                 .regs
